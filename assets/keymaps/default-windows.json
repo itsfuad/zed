@@ -1127,6 +1127,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-alt-space": "terminal::ShowCharacterPalette",
+      "ctrl-space": "terminal::ShowCompletions",
       "ctrl-insert": "terminal::Copy",
       "ctrl-shift-c": "terminal::Copy",
       "shift-insert": "terminal::Paste",
@@ -1168,6 +1169,17 @@
       "ctrl-alt-r": "terminal::RerunTask",
       "alt-t": "terminal::RerunTask",
       "ctrl-shift-5": "pane::SplitRight",
+    },
+  },
+  {
+    "context": "Terminal && terminal_completion_menu",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "terminal::CancelCompletion",
+      "up": "terminal::SelectPreviousCompletion",
+      "down": "terminal::SelectNextCompletion",
+      "enter": "terminal::AcceptCompletion",
+      "tab": "terminal::AcceptCompletion",
     },
   },
   {

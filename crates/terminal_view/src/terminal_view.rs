@@ -22,7 +22,7 @@ use terminal::{
     TaskStatus, Terminal, TerminalBounds, ToggleViMode,
     alacritty_terminal::{
         index::Point,
-        term::{TermMode, point_to_viewport, search::RegexSearch},
+        term::{TermMode, cell::Flags, point_to_viewport, search::RegexSearch},
     },
     terminal_settings::{CursorShape, TerminalSettings},
 };
@@ -32,7 +32,7 @@ use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
 use terminal_slash_command::TerminalSlashCommand;
 use ui::{
-    ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    ContextMenu, Divider, ListItem, Popover, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
     scrollbars::{self, GlobalSetting, ScrollbarVisibility},
 };
@@ -51,13 +51,18 @@ use serde::Deserialize;
 use settings::{Settings, SettingsStore, TerminalBlink, WorkingDirectory};
 use zed_actions::assistant::InlineAssist;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use std::{
     cmp,
+    collections::HashSet,
+    ffi::OsString,
     ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 struct ImeState {
@@ -66,6 +71,28 @@ struct ImeState {
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const TERMINAL_COMPLETION_MAX_ITEMS: usize = 50;
+const TERMINAL_COMMAND_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct CommandCache {
+    last_refresh: Option<Instant>,
+    path: Option<OsString>,
+    pathext: Option<OsString>,
+    commands: Vec<String>,
+}
+
+impl Default for CommandCache {
+    fn default() -> Self {
+        Self {
+            last_refresh: None,
+            path: None,
+            pathext: None,
+            commands: Vec::new(),
+        }
+    }
+}
+
+static COMMAND_CACHE: OnceLock<Mutex<CommandCache>> = OnceLock::new();
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +107,27 @@ pub struct SendText(String);
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = terminal)]
 pub struct SendKeystroke(String);
+
+/// Opens a lightweight completion popup for the active terminal input.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = terminal)]
+pub struct ShowCompletions;
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = terminal)]
+pub struct CancelCompletion;
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = terminal)]
+pub struct AcceptCompletion;
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = terminal)]
+pub struct SelectNextCompletion;
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = terminal)]
+pub struct SelectPreviousCompletion;
 
 actions!(
     terminal,
@@ -113,6 +161,27 @@ pub struct BlockContext<'a, 'b> {
     pub dimensions: TerminalBounds,
 }
 
+#[derive(Clone, Debug)]
+enum TerminalCompletionKind {
+    Command,
+    Path { is_dir: bool },
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCompletionItem {
+    label: SharedString,
+    insert_text: SharedString,
+    kind: TerminalCompletionKind,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCompletionMenu {
+    token: SharedString,
+    items: Vec<TerminalCompletionItem>,
+    selected_ix: usize,
+    anchor: gpui::Point<Pixels>,
+}
+
 ///A terminal view, maintains the PTY's file handles and communicates with the terminal
 pub struct TerminalView {
     terminal: Entity<Terminal>,
@@ -135,6 +204,9 @@ pub struct TerminalView {
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
+    completion_menu: Option<TerminalCompletionMenu>,
+    completion_request_id: u64,
+    completion_update_task: Task<()>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -271,6 +343,9 @@ impl TerminalView {
             scroll_handle,
             cwd_serialized: false,
             ime_state: None,
+            completion_menu: None,
+            completion_request_id: 0,
+            completion_update_task: Task::ready(()),
             _subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -734,6 +809,168 @@ impl TerminalView {
         }
     }
 
+    fn completion_request(
+        &self,
+        cx: &App,
+    ) -> Option<(String, gpui::Point<Pixels>, Option<PathBuf>)> {
+        let terminal = self.terminal.read(cx);
+        let content = terminal.last_content();
+
+        // Avoid interfering with full-screen TUIs / scrolled-back history.
+        if content.mode.contains(TermMode::ALT_SCREEN) || content.display_offset != 0 {
+            return None;
+        }
+
+        let cols = content.terminal_bounds.num_columns();
+        if cols == 0 {
+            return None;
+        }
+
+        let cursor_line = content.cursor.point.line.0;
+        let cursor_col = content.cursor.point.column.0.min(cols);
+
+        let mut line = vec![' '; cols];
+        for cell in &content.cells {
+            if cell.point.line.0 != cursor_line {
+                continue;
+            }
+            let col = cell.point.column.0;
+            if col >= cols {
+                continue;
+            }
+            if cell.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            line[col] = cell.cell.c;
+        }
+
+        let token_start = line[..cursor_col]
+            .iter()
+            .rposition(|c| *c == ' ' || *c == '\t')
+            .map(|ix| ix + 1)
+            .unwrap_or(0);
+
+        let token: String = line[token_start..cursor_col].iter().collect();
+        if token.is_empty() {
+            return None;
+        }
+
+        let cursor_display_line = content.cursor.point.line.0 + content.display_offset as i32;
+        let origin = content.terminal_bounds.bounds.origin;
+        let anchor = gpui::Point::new(
+            origin.x + cursor_col as f32 * content.terminal_bounds.cell_width,
+            origin.y - self.scroll_top
+                + cursor_display_line as f32 * content.terminal_bounds.line_height
+                + content.terminal_bounds.line_height,
+        );
+
+        Some((token, anchor, terminal.working_directory()))
+    }
+
+    fn show_completions(&mut self, _: &ShowCompletions, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((token, anchor, cwd)) = self.completion_request(cx) else {
+            return;
+        };
+
+        self.completion_request_id = self.completion_request_id.wrapping_add(1);
+        let request_id = self.completion_request_id;
+
+        let token_for_task = token.clone();
+        let token_for_menu: SharedString = token.clone().into();
+        let completion_task = cx
+            .background_spawn(async move { terminal_completions_for_token(&token_for_task, cwd) });
+
+        self.completion_update_task = cx.spawn(async move |this, cx| {
+            let items = completion_task.await;
+            this.update(cx, |terminal_view, cx| {
+                if terminal_view.completion_request_id != request_id {
+                    return;
+                }
+
+                if items.is_empty() {
+                    terminal_view.completion_menu = None;
+                } else {
+                    terminal_view.completion_menu = Some(TerminalCompletionMenu {
+                        token: token_for_menu.clone(),
+                        items,
+                        selected_ix: 0,
+                        anchor,
+                    });
+                }
+
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn cancel_completion(&mut self, _: &CancelCompletion, _: &mut Window, cx: &mut Context<Self>) {
+        self.completion_menu = None;
+        cx.notify();
+    }
+
+    fn select_next_completion(
+        &mut self,
+        _: &SelectNextCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.completion_menu.as_mut() else {
+            return;
+        };
+        if menu.items.is_empty() {
+            return;
+        }
+        menu.selected_ix = (menu.selected_ix + 1) % menu.items.len();
+        cx.notify();
+    }
+
+    fn select_previous_completion(
+        &mut self,
+        _: &SelectPreviousCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.completion_menu.as_mut() else {
+            return;
+        };
+        if menu.items.is_empty() {
+            return;
+        }
+        menu.selected_ix = menu
+            .selected_ix
+            .checked_sub(1)
+            .unwrap_or(menu.items.len() - 1);
+        cx.notify();
+    }
+
+    fn accept_completion(&mut self, _: &AcceptCompletion, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.completion_menu.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected_ix).cloned() else {
+            return;
+        };
+
+        let token = menu.token.as_ref();
+        let insert = item.insert_text.as_ref();
+
+        let mut bytes = Vec::new();
+        if let Some(suffix) = insert.strip_prefix(token) {
+            bytes.extend_from_slice(suffix.as_bytes());
+        } else {
+            bytes.extend(std::iter::repeat(0x08).take(token.chars().count()));
+            bytes.extend_from_slice(insert.as_bytes());
+        }
+
+        if !bytes.is_empty() {
+            self.clear_bell(cx);
+            self.terminal.update(cx, |term, _| term.input(bytes));
+        }
+
+        cx.notify();
+    }
+
     fn dispatch_context(&self, cx: &App) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
@@ -813,6 +1050,10 @@ impl TerminalView {
 
         if self.terminal.read(cx).last_content.selection.is_some() {
             dispatch_context.add("selection");
+        }
+
+        if self.completion_menu.is_some() {
+            dispatch_context.add("terminal_completion_menu");
         }
 
         dispatch_context
@@ -991,6 +1232,287 @@ fn regex_search_for_query(query: &project::search::SearchQuery) -> Option<RegexS
     }
 }
 
+fn command_cache() -> &'static Mutex<CommandCache> {
+    COMMAND_CACHE.get_or_init(|| Mutex::new(CommandCache::default()))
+}
+
+fn looks_like_path(token: &str) -> bool {
+    let token = token.trim_start_matches(['"', '\'']);
+    if token.is_empty() {
+        return false;
+    }
+
+    // Avoid offering path completions for obvious flags.
+    if token.starts_with('-') {
+        return false;
+    }
+
+    token.contains(['/', '\\', ':']) || token.starts_with(['.', '~'])
+}
+
+fn terminal_completions_for_token(
+    token: &str,
+    cwd: Option<PathBuf>,
+) -> Vec<TerminalCompletionItem> {
+    if looks_like_path(token) {
+        cwd.as_deref()
+            .map(|cwd| path_completions(token, cwd))
+            .unwrap_or_default()
+    } else {
+        command_completions(token)
+    }
+}
+
+fn path_completions(token: &str, cwd: &Path) -> Vec<TerminalCompletionItem> {
+    let (leading_quote, token) = if let Some(rest) = token.strip_prefix('"') {
+        (Some('"'), rest)
+    } else if let Some(rest) = token.strip_prefix('\'') {
+        (Some('\''), rest)
+    } else {
+        (None, token)
+    };
+
+    let (dir_part, partial) = match token.rfind(|c| c == '/' || c == '\\') {
+        Some(ix) => (&token[..=ix], &token[(ix + 1)..]),
+        None => ("", token),
+    };
+
+    let sep = if dir_part.contains('/') {
+        '/'
+    } else if dir_part.contains('\\') {
+        '\\'
+    } else if token.contains('/') {
+        '/'
+    } else if token.contains('\\') {
+        '\\'
+    } else {
+        std::path::MAIN_SEPARATOR
+    };
+
+    let base_dir = if dir_part.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        let p = Path::new(dir_part);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    };
+
+    let read_dir = match std::fs::read_dir(&base_dir) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return Vec::new(),
+    };
+
+    let partial_cmp = if cfg!(windows) {
+        partial.to_ascii_lowercase()
+    } else {
+        partial.to_string()
+    };
+
+    let mut items = Vec::new();
+    for entry in read_dir.flatten() {
+        let file_type = entry.file_type().ok();
+        let is_dir = file_type.as_ref().is_some_and(|ft| ft.is_dir());
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        let name_cmp = if cfg!(windows) {
+            name.to_ascii_lowercase()
+        } else {
+            name.clone()
+        };
+        if !name_cmp.starts_with(&partial_cmp) {
+            continue;
+        }
+
+        let mut insert = String::new();
+        if let Some(q) = leading_quote {
+            insert.push(q);
+        }
+        insert.push_str(dir_part);
+        insert.push_str(&name);
+        if is_dir && !insert.ends_with(sep) {
+            insert.push(sep);
+        }
+
+        let mut label = name;
+        if is_dir && !label.ends_with(sep) {
+            label.push(sep);
+        }
+
+        items.push(TerminalCompletionItem {
+            label: label.into(),
+            insert_text: insert.into(),
+            kind: TerminalCompletionKind::Path { is_dir },
+        });
+
+        if items.len() >= TERMINAL_COMPLETION_MAX_ITEMS {
+            break;
+        }
+    }
+
+    items.sort_by(|a, b| match (&a.kind, &b.kind) {
+        (
+            TerminalCompletionKind::Path { is_dir: true },
+            TerminalCompletionKind::Path { is_dir: false },
+        ) => std::cmp::Ordering::Less,
+        (
+            TerminalCompletionKind::Path { is_dir: false },
+            TerminalCompletionKind::Path { is_dir: true },
+        ) => std::cmp::Ordering::Greater,
+        _ => a
+            .label
+            .to_string()
+            .to_ascii_lowercase()
+            .cmp(&b.label.to_string().to_ascii_lowercase()),
+    });
+
+    items
+}
+
+fn command_completions(prefix: &str) -> Vec<TerminalCompletionItem> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let path = std::env::var_os("PATH");
+    #[cfg(windows)]
+    let pathext = std::env::var_os("PATHEXT");
+    #[cfg(not(windows))]
+    let pathext: Option<OsString> = None;
+
+    let mut cache = command_cache().lock().expect("command cache lock poisoned");
+    let now = Instant::now();
+    let stale = cache
+        .last_refresh
+        .is_none_or(|t| now.duration_since(t) > TERMINAL_COMMAND_CACHE_TTL);
+    if stale || cache.path.as_ref() != path.as_ref() || cache.pathext.as_ref() != pathext.as_ref() {
+        refresh_command_cache(&mut cache, path.clone(), pathext.clone());
+    }
+    let commands = cache.commands.clone();
+    drop(cache);
+
+    let prefix_cmp = if cfg!(windows) {
+        prefix.to_ascii_lowercase()
+    } else {
+        prefix.to_string()
+    };
+
+    let mut items = Vec::new();
+    for cmd in commands {
+        let cmd_cmp = if cfg!(windows) {
+            cmd.to_ascii_lowercase()
+        } else {
+            cmd.clone()
+        };
+        if !cmd_cmp.starts_with(&prefix_cmp) {
+            continue;
+        }
+
+        items.push(TerminalCompletionItem {
+            label: cmd.clone().into(),
+            insert_text: cmd.into(),
+            kind: TerminalCompletionKind::Command,
+        });
+
+        if items.len() >= TERMINAL_COMPLETION_MAX_ITEMS {
+            break;
+        }
+    }
+
+    items
+}
+
+fn refresh_command_cache(
+    cache: &mut CommandCache,
+    path: Option<OsString>,
+    pathext: Option<OsString>,
+) {
+    let exts = parse_pathext(pathext.as_ref());
+
+    let mut seen = HashSet::<String>::new();
+    let mut commands = Vec::new();
+
+    if let Some(path) = &path {
+        for dir in std::env::split_paths(path) {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+
+            for entry in read_dir.flatten() {
+                let entry_path = entry.path();
+                if !entry_path.is_file() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !is_executable_name(&name, &exts, &entry_path) {
+                    continue;
+                }
+
+                let dedupe_key = if cfg!(windows) {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.clone()
+                };
+
+                if seen.insert(dedupe_key) {
+                    commands.push(name);
+                }
+            }
+        }
+    }
+
+    commands.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+
+    cache.last_refresh = Some(Instant::now());
+    cache.path = path;
+    cache.pathext = pathext;
+    cache.commands = commands;
+}
+
+#[cfg(windows)]
+fn parse_pathext(pathext: Option<&OsString>) -> Vec<String> {
+    let pathext = pathext
+        .and_then(|s| s.to_str())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD");
+
+    pathext
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let mut ext = s.trim().to_ascii_lowercase();
+            if !ext.starts_with('.') {
+                ext.insert(0, '.');
+            }
+            ext
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn parse_pathext(_pathext: Option<&OsString>) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn is_executable_name(name: &str, exts: &[String], _path: &Path) -> bool {
+    let lower = name.to_ascii_lowercase();
+    exts.iter().any(|ext| lower.ends_with(ext))
+}
+
+#[cfg(unix)]
+fn is_executable_name(_name: &str, _exts: &[String], path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn is_executable_name(_name: &str, _exts: &[String], path: &Path) -> bool {
+    // Best effort on platforms where we can't easily check executable bits.
+    path.is_file()
+}
+
 struct TerminalScrollbarSettingsWrapper;
 
 impl GlobalSetting for TerminalScrollbarSettingsWrapper {
@@ -1013,6 +1535,14 @@ impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
+
+        if self.completion_menu.is_some()
+            && (event.keystroke.key_char.is_some()
+                || matches!(event.keystroke.key.as_str(), "backspace" | "delete"))
+        {
+            self.completion_menu = None;
+            cx.notify();
+        }
 
         self.terminal.update(cx, |term, cx| {
             let handled = term.try_keystroke(
@@ -1047,6 +1577,7 @@ impl TerminalView {
 
     fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.blink_manager.update(cx, BlinkManager::disable);
+        self.completion_menu = None;
         self.terminal.update(cx, |terminal, _| {
             terminal.focus_out();
             terminal.set_cursor_shape(CursorShape::Hollow);
@@ -1084,6 +1615,11 @@ impl Render for TerminalView {
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))
+            .on_action(cx.listener(TerminalView::show_completions))
+            .on_action(cx.listener(TerminalView::cancel_completion))
+            .on_action(cx.listener(TerminalView::accept_completion))
+            .on_action(cx.listener(TerminalView::select_next_completion))
+            .on_action(cx.listener(TerminalView::select_previous_completion))
             .on_action(cx.listener(TerminalView::copy))
             .on_action(cx.listener(TerminalView::paste))
             .on_action(cx.listener(TerminalView::clear))
@@ -1148,6 +1684,60 @@ impl Render for TerminalView {
                         .position(*position)
                         .anchor(gpui::Corner::TopLeft)
                         .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
+            .children(self.completion_menu.as_ref().map(|menu| {
+                let anchor = menu.anchor;
+                deferred(
+                    anchored()
+                        .position(anchor)
+                        .anchor(gpui::Corner::TopLeft)
+                        .child(
+                            Popover::new().child(
+                                v_flex()
+                                    .id("terminal-completion-menu")
+                                    .max_h(px(300.))
+                                    .overflow_y_scroll()
+                                    .children(menu.items.iter().enumerate().map(|(ix, item)| {
+                                        let item_ix = ix;
+                                        let icon = match &item.kind {
+                                            TerminalCompletionKind::Command => IconName::Terminal,
+                                            TerminalCompletionKind::Path { is_dir: true } => {
+                                                IconName::Folder
+                                            }
+                                            TerminalCompletionKind::Path { is_dir: false } => {
+                                                IconName::File
+                                            }
+                                        };
+
+                                        ListItem::new(item_ix)
+                                            .inset(true)
+                                            .toggle_state(item_ix == menu.selected_ix)
+                                            .start_slot(
+                                                Icon::new(icon)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(Label::new(item.label.clone()))
+                                            .on_click(cx.listener(
+                                                move |this, _event, window, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(menu) =
+                                                        this.completion_menu.as_mut()
+                                                    {
+                                                        menu.selected_ix = item_ix;
+                                                    }
+                                                    this.accept_completion(
+                                                        &AcceptCompletion,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ))
+                                    })),
+                            ),
+                        ),
                 )
                 .with_priority(1)
             }))
