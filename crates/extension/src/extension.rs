@@ -5,7 +5,7 @@ mod extension_host_proxy;
 mod extension_manifest;
 mod types;
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use ::lsp::LanguageServerName;
@@ -222,22 +222,41 @@ fn parse_wasm_extension_version_custom_section(data: &[u8]) -> Option<Version> {
 
 pub fn resolve_language_icon(language_path: &Path, icon: Option<&str>) -> Option<Arc<str>> {
     let icon = icon?;
-    if icon.contains(['/', '\\']) || icon.ends_with(".svg") {
-        Some(
-            language_path
-                .join(icon)
-                .to_string_lossy()
-                .into_owned()
-                .into(),
-        )
-    } else {
-        Some(icon.into())
+    if !looks_like_icon_asset_path(icon) {
+        return Some(icon.into());
     }
+
+    let icon_path = Path::new(icon);
+    if !is_safe_relative_icon_path(icon_path) {
+        return None;
+    }
+
+    let resolved_icon_path = language_path.join(icon_path);
+    let canonical_language_path = std::fs::canonicalize(language_path).ok()?;
+    let canonical_icon_path = std::fs::canonicalize(&resolved_icon_path).ok()?;
+    if !canonical_icon_path.starts_with(&canonical_language_path) {
+        return None;
+    }
+
+    Some(resolved_icon_path.to_string_lossy().into_owned().into())
+}
+
+fn looks_like_icon_asset_path(icon: &str) -> bool {
+    icon.contains(['/', '\\']) || icon.ends_with(".svg")
+}
+
+fn is_safe_relative_icon_path(icon_path: &Path) -> bool {
+    icon_path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+
+    use tempfile::TempDir;
 
     use super::resolve_language_icon;
 
@@ -251,14 +270,64 @@ mod tests {
 
     #[test]
     fn resolves_language_icon_assets_relative_to_language_dir() {
-        let expected = Path::new("languages/example")
+        let temp_dir = TempDir::new().unwrap();
+        let language_dir = temp_dir.path().join("languages").join("example");
+        fs::create_dir_all(&language_dir).unwrap();
+        fs::write(language_dir.join("language-icon.svg"), "").unwrap();
+
+        let expected = language_dir
             .join("language-icon.svg")
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            resolve_language_icon(Path::new("languages/example"), Some("language-icon.svg"))
-                .as_deref(),
+            resolve_language_icon(&language_dir, Some("language-icon.svg")).as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn resolves_nested_language_icon_assets_within_language_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let language_dir = temp_dir.path().join("languages").join("example");
+        let icons_dir = language_dir.join("icons");
+        fs::create_dir_all(&icons_dir).unwrap();
+        fs::write(icons_dir.join("language-icon.svg"), "").unwrap();
+
+        let expected = language_dir
+            .join(Path::new("icons/language-icon.svg"))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_language_icon(&language_dir, Some("icons/language-icon.svg")).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn rejects_language_icon_paths_with_parent_dir_components() {
+        let temp_dir = TempDir::new().unwrap();
+        let language_dir = temp_dir.path().join("languages").join("example");
+        fs::create_dir_all(&language_dir).unwrap();
+
+        assert_eq!(
+            resolve_language_icon(&language_dir, Some("../language-icon.svg")).as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_language_icon_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let language_dir = temp_dir.path().join("languages").join("example");
+        fs::create_dir_all(&language_dir).unwrap();
+
+        let absolute_icon_path = temp_dir.path().join("language-icon.svg");
+        fs::write(&absolute_icon_path, "").unwrap();
+
+        assert_eq!(
+            resolve_language_icon(&language_dir, Some(&absolute_icon_path.to_string_lossy()))
+                .as_deref(),
+            None
         );
     }
 }
