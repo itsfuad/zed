@@ -237,6 +237,7 @@ pub trait ExtensionLanguageProxy: Send + Sync + 'static {
     fn register_language(
         &self,
         language: LanguageName,
+        icon: Option<Arc<str>>,
         grammar: Option<Arc<str>>,
         matcher: LanguageMatcher,
         hidden: bool,
@@ -255,6 +256,7 @@ impl ExtensionLanguageProxy for ExtensionHostProxy {
     fn register_language(
         &self,
         language: LanguageName,
+        icon: Option<Arc<str>>,
         grammar: Option<Arc<str>>,
         matcher: LanguageMatcher,
         hidden: bool,
@@ -264,7 +266,7 @@ impl ExtensionLanguageProxy for ExtensionHostProxy {
             return;
         };
 
-        proxy.register_language(language, grammar, matcher, hidden, load)
+        proxy.register_language(language, icon, grammar, matcher, hidden, load)
     }
 
     fn remove_languages(

@@ -16,7 +16,7 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use globset::GlobSet;
-use gpui::{App, BackgroundExecutor};
+use gpui::{App, BackgroundExecutor, Global};
 use lsp::LanguageServerId;
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
@@ -41,6 +41,11 @@ pub struct LanguageRegistry {
     executor: BackgroundExecutor,
     lsp_binary_status_tx: ServerStatusSender,
 }
+
+#[derive(Clone)]
+struct GlobalLanguageRegistry(Arc<LanguageRegistry>);
+
+impl Global for GlobalLanguageRegistry {}
 
 struct LanguageRegistryState {
     next_language_server_id: usize,
@@ -74,6 +79,7 @@ pub struct FakeLanguageServerEntry {
 pub struct AvailableLanguage {
     id: LanguageId,
     name: LanguageName,
+    icon: Option<Arc<str>>,
     grammar: Option<Arc<str>>,
     matcher: LanguageMatcher,
     hidden: bool,
@@ -85,6 +91,10 @@ pub struct AvailableLanguage {
 impl AvailableLanguage {
     pub fn name(&self) -> LanguageName {
         self.name.clone()
+    }
+
+    pub fn icon(&self) -> Option<&Arc<str>> {
+        self.icon.as_ref()
     }
 
     pub fn matcher(&self) -> &LanguageMatcher {
@@ -138,6 +148,19 @@ pub struct LoadedLanguage {
 }
 
 impl LanguageRegistry {
+    pub fn set_global(this: Arc<Self>, cx: &mut App) {
+        cx.set_global(GlobalLanguageRegistry(this));
+    }
+
+    pub fn try_global(cx: &App) -> Option<Arc<Self>> {
+        cx.try_global::<GlobalLanguageRegistry>()
+            .map(|registry| registry.0.clone())
+    }
+
+    pub fn global(cx: &App) -> Arc<Self> {
+        cx.global::<GlobalLanguageRegistry>().0.clone()
+    }
+
     pub fn new(executor: BackgroundExecutor) -> Self {
         let this = Self {
             state: RwLock::new(LanguageRegistryState {
@@ -222,6 +245,7 @@ impl LanguageRegistry {
     pub fn register_test_language(&self, config: LanguageConfig) {
         self.register_language(
             config.name.clone(),
+            config.icon.clone(),
             config.grammar.clone(),
             config.matcher.clone(),
             config.hidden,
@@ -387,6 +411,7 @@ impl LanguageRegistry {
     pub fn register_language(
         &self,
         name: LanguageName,
+        icon: Option<Arc<str>>,
         grammar_name: Option<Arc<str>>,
         matcher: LanguageMatcher,
         hidden: bool,
@@ -397,8 +422,10 @@ impl LanguageRegistry {
 
         for existing_language in &mut state.available_languages {
             if existing_language.name == name {
+                existing_language.icon = icon;
                 existing_language.grammar = grammar_name;
                 existing_language.matcher = matcher;
+                existing_language.hidden = hidden;
                 existing_language.load = load;
                 existing_language.manifest_name = manifest_name;
                 return;
@@ -408,6 +435,7 @@ impl LanguageRegistry {
         state.available_languages.push(AvailableLanguage {
             id: LanguageId::new(),
             name,
+            icon,
             grammar: grammar_name,
             matcher,
             load,
@@ -479,6 +507,7 @@ impl LanguageRegistry {
         state.available_languages.push(AvailableLanguage {
             id: language.id,
             name: language.name(),
+            icon: language.config.icon.clone(),
             grammar: language.config.grammar.clone(),
             matcher: language.config.matcher.clone(),
             hidden: language.config.hidden,

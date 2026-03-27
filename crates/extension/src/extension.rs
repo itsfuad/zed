@@ -219,3 +219,46 @@ fn parse_wasm_extension_version_custom_section(data: &[u8]) -> Option<Version> {
         None
     }
 }
+
+pub fn resolve_language_icon(language_path: &Path, icon: Option<&str>) -> Option<Arc<str>> {
+    let icon = icon?;
+    if icon.contains(['/', '\\']) || icon.ends_with(".svg") {
+        Some(
+            language_path
+                .join(icon)
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        )
+    } else {
+        Some(icon.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::resolve_language_icon;
+
+    #[test]
+    fn resolves_language_icon_keys_without_rewriting() {
+        assert_eq!(
+            resolve_language_icon(Path::new("languages/example"), Some("json")).as_deref(),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn resolves_language_icon_assets_relative_to_language_dir() {
+        let expected = Path::new("languages/example")
+            .join("language-icon.svg")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_language_icon(Path::new("languages/example"), Some("language-icon.svg"))
+                .as_deref(),
+            Some(expected.as_str())
+        );
+    }
+}

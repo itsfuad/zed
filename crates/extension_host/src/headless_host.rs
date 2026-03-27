@@ -5,7 +5,7 @@ use client::{TypedEnvelope, proto};
 use collections::{HashMap, HashSet};
 use extension::{
     Extension, ExtensionDebugAdapterProviderProxy, ExtensionHostProxy, ExtensionLanguageProxy,
-    ExtensionLanguageServerProxy, ExtensionManifest,
+    ExtensionLanguageServerProxy, ExtensionManifest, resolve_language_icon,
 };
 use fs::{Fs, RemoveOptions, RenameOptions};
 use futures::future::join_all;
@@ -153,6 +153,7 @@ impl HeadlessExtensionStore {
 
                 this.proxy.register_language(
                     config.name.clone(),
+                    resolve_language_icon(&language_path, config.icon.as_deref()),
                     None,
                     config.matcher.clone(),
                     config.hidden,

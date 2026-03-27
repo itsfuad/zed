@@ -18,7 +18,7 @@ use extension::{
     ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
     ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
     ExtensionLanguageServerProxy, ExtensionSlashCommandProxy, ExtensionSnippetProxy,
-    ExtensionThemeProxy,
+    ExtensionThemeProxy, resolve_language_icon,
 };
 use fs::{Fs, RemoveOptions};
 use futures::future::join_all;
@@ -183,6 +183,8 @@ pub struct ExtensionIndexLanguageEntry {
     pub path: PathBuf,
     pub matcher: LanguageMatcher,
     pub hidden: bool,
+    #[serde(default)]
+    pub icon: Option<Arc<str>>,
     pub grammar: Option<Arc<str>>,
 }
 
@@ -1295,6 +1297,7 @@ impl ExtensionStore {
 
             self.proxy.register_language(
                 language_name.clone(),
+                resolve_language_icon(&language_path, language.icon.as_deref()),
                 language.grammar.clone(),
                 language.matcher.clone(),
                 language.hidden,
@@ -1591,6 +1594,7 @@ impl ExtensionStore {
                         path: relative_path,
                         matcher: config.matcher,
                         hidden: config.hidden,
+                        icon: config.icon,
                         grammar: config.grammar,
                     },
                 );

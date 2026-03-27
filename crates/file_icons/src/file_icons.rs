@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::{path::Path, str};
 
 use gpui::{App, SharedString};
+use language::LanguageRegistry;
 use theme::{GlobalTheme, IconTheme, ThemeRegistry};
 use util::paths::PathExt;
 
@@ -27,9 +28,6 @@ impl FileIcons {
                 .or_else(|| this.icon_theme.file_suffixes.get(suffix))
                 .and_then(|typ| this.get_icon_for_type(typ, cx))
         };
-        // TODO: Associate a type with the languages and have the file's language
-        //       override these associations
-
         if let Some(mut typ) = path.file_name().and_then(|typ| typ.to_str()) {
             // check if file name is in suffixes
             // e.g. catch file named `eslint.config.js` instead of `.eslint.config.js`
@@ -78,6 +76,11 @@ impl FileIcons {
                 return maybe_path;
             }
         }
+
+        if let Some(icon) = this.get_icon_for_language(path, cx) {
+            return Some(icon);
+        }
+
         this.get_icon_for_type("default", cx)
     }
 
@@ -97,6 +100,23 @@ impl FileIcons {
         get_icon_for_type(GlobalTheme::icon_theme(cx), typ).or_else(|| {
             Self::default_icon_theme(cx).and_then(|icon_theme| get_icon_for_type(&icon_theme, typ))
         })
+    }
+
+    fn get_icon_for_language(&self, path: &Path, cx: &App) -> Option<SharedString> {
+        let registry = LanguageRegistry::try_global(cx)?;
+        let language = registry.language_for_file_path(path)?;
+
+        if let Some(icon) = language.icon().cloned() {
+            if looks_like_icon_asset_path(&icon) {
+                return Some(SharedString::from(icon.to_string()));
+            }
+
+            if let Some(icon_path) = self.get_icon_for_type(&icon, cx) {
+                return Some(icon_path);
+            }
+        }
+
+        self.get_icon_for_type(&language.name().0.to_lowercase(), cx)
     }
 
     pub fn get_folder_icon(expanded: bool, path: &Path, cx: &App) -> Option<SharedString> {
@@ -163,4 +183,8 @@ impl FileIcons {
                 .and_then(|icon_theme| get_chevron_icon(&icon_theme, expanded))
         })
     }
+}
+
+fn looks_like_icon_asset_path(icon: &str) -> bool {
+    icon.contains(['/', '\\']) || icon.ends_with(".svg")
 }

@@ -54,6 +54,8 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
     });
 
 pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
+    LanguageRegistry::set_global(languages.clone(), cx);
+
     #[cfg(feature = "load-grammars")]
     languages.register_native_grammars(grammars::native_grammars());
 
@@ -355,6 +357,7 @@ fn register_language(
     }
     languages.register_language(
         config.name.clone(),
+        config.icon.clone(),
         config.grammar.clone(),
         config.matcher.clone(),
         config.hidden,

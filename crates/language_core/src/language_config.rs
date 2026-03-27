@@ -31,6 +31,13 @@ pub enum SoftWrap {
 pub struct LanguageConfig {
     /// Human-readable name of the language.
     pub name: LanguageName,
+    /// Optional file icon override for this language.
+    ///
+    /// If this is a plain identifier such as `rs`, Zed treats it as an icon
+    /// theme file type key. If it looks like an SVG path, extension hosts may
+    /// resolve it to an absolute asset path.
+    #[serde(default)]
+    pub icon: Option<Arc<str>>,
     /// The name of this language for a Markdown code fence block
     pub code_fence_block_name: Option<Arc<str>>,
     /// Alternative language names that Jupyter kernels may report for this language.
@@ -172,6 +179,7 @@ impl Default for LanguageConfig {
     fn default() -> Self {
         Self {
             name: LanguageName::new_static(""),
+            icon: None,
             code_fence_block_name: None,
             kernel_language_names: Default::default(),
             grammar: None,
