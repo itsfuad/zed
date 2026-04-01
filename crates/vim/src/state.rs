@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::{fmt::Display, ops::Range, sync::Arc};
 use text::{Bias, ToPoint};
-use theme::ThemeSettings;
+use theme_settings::ThemeSettings;
 use ui::{
     ActiveTheme, Context, Div, FluentBuilder, KeyBinding, ParentElement, SharedString, Styled,
     StyledTypography, Window, h_flex, rems,
@@ -1022,6 +1022,7 @@ impl Clone for ReplayableAction {
 pub struct SearchState {
     pub direction: Direction,
     pub count: usize,
+    pub cmd_f_search: bool,
 
     pub prior_selections: Vec<Range<Anchor>>,
     pub prior_operator: Option<Operator>,
