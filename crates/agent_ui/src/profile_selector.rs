@@ -31,6 +31,9 @@ pub trait ProfileProvider {
 
     /// Check if profiles are supported in the current context (e.g. if the model that is selected has tool support)
     fn profiles_supported(&self, cx: &App) -> bool;
+
+    /// Check if there is a model selected in the current context.
+    fn model_selected(&self, cx: &App) -> bool;
 }
 
 pub struct ProfileSelector {
@@ -153,11 +156,16 @@ impl Focusable for ProfileSelector {
 impl Render for ProfileSelector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.provider.profiles_supported(cx) {
-            return Button::new("tools-not-supported-button", "Tools Unsupported")
+            let (label, tooltip) = match self.provider.model_selected(cx) {
+                true => ("Tools Unsupported", "This model does not support tools."),
+                false => ("Profile", "Select a model that supports tools."),
+            };
+
+            return Button::new("tools-not-supported-button", label)
                 .disabled(true)
                 .label_size(LabelSize::Small)
                 .color(Color::Muted)
-                .tooltip(Tooltip::text("This model does not support tools."))
+                .tooltip(Tooltip::text(tooltip))
                 .into_any_element();
         }
 
@@ -792,11 +800,15 @@ mod tests {
 
     struct TestProfileProvider {
         profile_id: AgentProfileId,
+        has_model: bool,
     }
 
     impl TestProfileProvider {
         fn new(profile_id: AgentProfileId) -> Self {
-            Self { profile_id }
+            Self {
+                profile_id,
+                has_model: true,
+            }
         }
     }
 
@@ -809,6 +821,10 @@ mod tests {
 
         fn profiles_supported(&self, _cx: &App) -> bool {
             true
+        }
+
+        fn model_selected(&self, _cx: &App) -> bool {
+            self.has_model
         }
     }
 }
