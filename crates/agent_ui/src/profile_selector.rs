@@ -7,7 +7,7 @@ use agent_settings::{
 use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
-    Action, AnyElement, AnyView, App, BackgroundExecutor, Context, DismissEvent, Entity,
+    Action, AnyElement, AnyView, App, BackgroundExecutor, Context, DismissEvent, Empty, Entity,
     FocusHandle, Focusable, ForegroundExecutor, SharedString, Subscription, Task, Window,
 };
 use picker::{Picker, PickerDelegate, popover_menu::PickerPopoverMenu};
@@ -155,17 +155,16 @@ impl Focusable for ProfileSelector {
 
 impl Render for ProfileSelector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.provider.profiles_supported(cx) {
-            let (label, tooltip) = match self.provider.model_selected(cx) {
-                true => ("Tools Unsupported", "This model does not support tools."),
-                false => ("Profile", "Select a model that supports tools."),
-            };
+        if !self.provider.model_selected(cx) {
+            return Empty.into_any_element();
+        }
 
-            return Button::new("tools-not-supported-button", label)
+        if !self.provider.profiles_supported(cx) {
+            return Button::new("tools-not-supported-button", "Tools Unsupported")
                 .disabled(true)
                 .label_size(LabelSize::Small)
                 .color(Color::Muted)
-                .tooltip(Tooltip::text(tooltip))
+                .tooltip(Tooltip::text("This model does not support tools."))
                 .into_any_element();
         }
 
