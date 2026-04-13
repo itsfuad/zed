@@ -22,7 +22,7 @@ use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
-use crate::{branch_picker, git_panel::show_error_toast, resolve_active_repository};
+use crate::{branch_picker, git_panel::show_error_toast};
 
 actions!(
     branch_picker,
@@ -59,7 +59,7 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let workspace_handle = workspace.weak_handle();
-    let repository = resolve_active_repository(workspace, cx);
+    let repository = workspace.project().read(cx).active_repository(cx);
 
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(
@@ -885,12 +885,16 @@ impl PickerDelegate for BranchListDelegate {
             })
             .unwrap_or_else(|| (None, None, None));
 
+        let is_head_branch = entry.as_branch().is_some_and(|branch| branch.is_head);
+
         let entry_icon = match entry {
             Entry::NewUrl { .. } | Entry::NewBranch { .. } | Entry::NewRemoteName { .. } => {
                 IconName::Plus
             }
             Entry::Branch { branch, .. } => {
-                if branch.is_remote() {
+                if is_head_branch {
+                    IconName::Check
+                } else if branch.is_remote() {
                     IconName::Screen
                 } else {
                     IconName::GitBranchAlt
@@ -975,7 +979,11 @@ impl PickerDelegate for BranchListDelegate {
                         .flex_grow()
                         .child(
                             Icon::new(entry_icon)
-                                .color(Color::Muted)
+                                .color(if is_head_branch {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                })
                                 .size(IconSize::Small),
                         )
                         .child(
@@ -1906,7 +1914,7 @@ mod tests {
         assert_eq!(
             remotes,
             vec![Remote {
-                name: SharedString::from("my_new_remote".to_string())
+                name: SharedString::from("my_new_remote")
             }]
         );
     }

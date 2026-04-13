@@ -3318,6 +3318,7 @@ impl ActionArgumentsEditor {
                         window,
                         cx,
                     );
+                    editor.disable_mouse_wheel_zoom();
                     editor.set_searchable(false);
                     editor.disable_scrollbars_and_minimap(window, cx);
                     editor.set_show_edit_predictions(Some(false), window, cx);
@@ -3480,7 +3481,6 @@ struct KeyContextCompletionProvider {
 impl CompletionProvider for KeyContextCompletionProvider {
     fn completions(
         &self,
-        _excerpt_id: editor::ExcerptId,
         buffer: &Entity<language::Buffer>,
         buffer_position: language::Anchor,
         _trigger: editor::CompletionContext,
