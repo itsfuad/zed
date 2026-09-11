@@ -58,7 +58,7 @@ impl RenderOnce for ProjectEmptyState {
             .track_focus(&self.focus_handle)
             .child(
                 v_flex()
-                    .w_48()
+                    .w_56()
                     .max_w_full()
                     .gap_1()
                     .child(

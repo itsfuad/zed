@@ -8061,6 +8061,17 @@ mod tests {
             assert!(cx.active_drag.is_none());
             assert_eq!(first_destination_exit_count.get(), 1);
             assert_eq!(second_destination_exit_count.get(), 0);
+
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: external_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+            assert_eq!(first_destination_exit_count.get(), 2);
         });
         assert!(
             update_result.is_ok(),

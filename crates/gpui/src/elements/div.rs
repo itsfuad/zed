@@ -329,9 +329,9 @@ impl Interactivity {
     }
 
     /// Bind the given callback to [`FileDropEvent::Exited`] when a platform file drag
-    /// leaves this element's window while the element is hovered.
+    /// leaves this element's window while the element is hovered, or to
+    /// [`FileDropEvent::Ended`] when the platform drag session ends.
     ///
-    /// This is a window-local exit event, not notification that the platform drag session ended.
     /// The imperative API equivalent to [`InteractiveElement::on_file_drop_exit`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -342,8 +342,9 @@ impl Interactivity {
         self.file_drop_exit_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
-                    && matches!(event, FileDropEvent::Exited)
-                    && hitbox.id.is_hovered_ignoring_last_input(window)
+                    && (matches!(event, FileDropEvent::Ended)
+                        || matches!(event, FileDropEvent::Exited)
+                            && hitbox.id.is_hovered_ignoring_last_input(window))
                 {
                     (listener)(event, window, cx);
                 }
@@ -1023,9 +1024,9 @@ pub trait InteractiveElement: Sized {
     }
 
     /// Bind the given callback to [`FileDropEvent::Exited`] when a platform file drag
-    /// leaves this element's window while the element is hovered.
+    /// leaves this element's window while the element is hovered, or to
+    /// [`FileDropEvent::Ended`] when the platform drag session ends.
     ///
-    /// This is a window-local exit event, not notification that the platform drag session ended.
     /// The fluent API equivalent to [`Interactivity::on_file_drop_exit`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
