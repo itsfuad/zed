@@ -597,6 +597,55 @@ pub struct AgentProfileContent {
     pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
     /// The default language model selected when using this profile.
     pub default_model: Option<LanguageModelSelection>,
+    /// Models native subagents may use, as exact `provider/model-id` identifiers.
+    /// Omit to allow all available models. An empty list allows none.
+    #[serde(default, skip_serializing_if = "SubagentModelAllowlist::is_unset")]
+    pub allowed_subagent_models: SubagentModelAllowlist,
+    /// Whether to ask for user approval when a subagent requests a model outside
+    /// this profile's allowlist. Approval applies only to that model and session.
+    ///
+    /// Default: false
+    pub allow_subagent_model_override: Option<bool>,
+}
+
+// Preserve malformed restrictions instead of recovering them as an unrestricted
+// `None` through `with_fallible_options`.
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(transparent)]
+pub struct SubagentModelAllowlist(
+    #[schemars(with = "Option<Vec<String>>")] pub Option<serde_json::Value>,
+);
+
+impl SubagentModelAllowlist {
+    pub fn is_unset(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn allows(&self, model_id: &str) -> anyhow::Result<bool> {
+        let Some(value) = self.0.as_ref() else {
+            return Ok(true);
+        };
+        let models = value.as_array().ok_or_else(|| {
+            anyhow::anyhow!("allowed_subagent_models must be an array of provider/model-id strings")
+        })?;
+        let mut allowed = false;
+        for value in models {
+            let model = value
+                .as_str()
+                .filter(|model| {
+                    model
+                        .split_once('/')
+                        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "allowed_subagent_models must contain provider/model-id strings"
+                    )
+                })?;
+            allowed |= model == model_id;
+        }
+        Ok(allowed)
+    }
 }
 
 #[with_fallible_options]
@@ -1154,6 +1203,86 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_model_allowlist_preserves_absent_empty_and_invalid_values() {
+        let unrestricted: AgentProfileContent =
+            serde_json::from_value(serde_json::json!({"name": "Test"}))
+                .expect("profile without a model policy");
+        assert!(
+            unrestricted
+                .allowed_subagent_models
+                .allows("fake/parent")
+                .expect("unrestricted policy")
+        );
+        assert!(unrestricted.allow_subagent_model_override.is_none());
+        assert!(
+            serde_json::to_value(&unrestricted)
+                .expect("serialize profile")
+                .get("allowed_subagent_models")
+                .is_none()
+        );
+
+        for (value, valid) in [
+            (serde_json::json!([]), true),
+            (serde_json::json!("fake/parent"), false),
+            (serde_json::json!([false]), false),
+            (serde_json::json!(["parent"]), false),
+            (serde_json::json!(["fake/preferred", false]), false),
+        ] {
+            let profile: AgentProfileContent = serde_json::from_value(serde_json::json!({
+                "name": "Test",
+                "allowed_subagent_models": value,
+                "allow_subagent_model_override": true,
+            }))
+            .expect("retain malformed policy for runtime validation");
+            assert!(!profile.allowed_subagent_models.is_unset());
+            let result = profile.allowed_subagent_models.allows("fake/preferred");
+            if valid {
+                assert!(!result.expect("empty allowlist is valid"));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "malformed policy must not become unrestricted"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&profile).expect("serialize profile")["allowed_subagent_models"],
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_model_allowlist_matches_provider_qualified_ids_and_replaces_on_merge() {
+        use crate::merge_from::MergeFrom as _;
+
+        let mut policy = SubagentModelAllowlist(Some(serde_json::json!([
+            "fake/parent",
+            "openrouter/vendor/model:free"
+        ])));
+        assert!(
+            policy
+                .allows("openrouter/vendor/model:free")
+                .expect("valid policy")
+        );
+        assert!(
+            !policy
+                .allows("other/vendor/model:free")
+                .expect("valid policy")
+        );
+
+        policy.merge_from(&SubagentModelAllowlist(Some(serde_json::json!([
+            "openrouter/vendor/model:free"
+        ]))));
+        policy.merge_from(&SubagentModelAllowlist::default());
+        assert!(!policy.allows("fake/parent").expect("narrowed policy"));
+        assert!(
+            policy
+                .allows("openrouter/vendor/model:free")
+                .expect("narrowed policy")
+        );
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {

@@ -109,4 +109,18 @@ Loads instructions from an available [Skill](./skills.md) so the agent can follo
 
 Spawns a subagent with its own context window to perform a delegated task. Useful for running parallel investigations, completing self-contained tasks, or performing research where only the outcome matters. Each subagent has access to the same tools as the parent agent.
 
+You can ask the parent agent to use a specific model for a delegated task. The
+agent calls `list_agents_and_models` and passes a native model's exact
+`provider/model-id` in the optional `model` argument. Without that argument, Zed
+uses `agent.subagent_model` when configured, otherwise the parent's model.
+
+[Profile model restrictions](./agent-profiles.md#subagent-model-restrictions)
+apply to both explicit and default selections. Discovery reports whether each
+native model is permitted or requires approval. If overrides are enabled, a
+model outside the allowlist requires your confirmation for that session.
+
+For follow-up work, the agent can provide the returned `session_id`. A resumed
+session keeps its model, so `session_id` cannot be combined with `model`. Zed
+checks the current model policy again when resuming.
+
 **Example:** While refactoring the authentication module, spawn a subagent to investigate how session tokens are validated elsewhere in the codebase. The parent agent continues its work and reviews the subagent's findings when it completes — keeping both context windows focused on a single task.

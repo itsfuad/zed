@@ -312,6 +312,10 @@ impl PickerDelegate for ToolPickerDelegate {
                             })
                             .collect(),
                         default_model: default_profile.default_model.clone(),
+                        allowed_subagent_models: default_profile.allowed_subagent_models,
+                        allow_subagent_model_override: Some(
+                            default_profile.allow_subagent_model_override,
+                        ),
                     });
 
                 if let Some(server_id) = server_id {

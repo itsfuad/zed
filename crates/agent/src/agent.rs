@@ -279,12 +279,7 @@ impl LanguageModels {
     }
 
     fn refresh_list(&mut self, cx: &App) {
-        let providers = LanguageModelRegistry::global(cx)
-            .read(cx)
-            .visible_providers()
-            .into_iter()
-            .filter(|provider| provider.is_authenticated(cx))
-            .collect::<Vec<_>>();
+        let providers = Self::available_providers(cx).collect::<Vec<_>>();
 
         let mut language_model_list = IndexMap::default();
         let mut recommended_models = HashSet::default();
@@ -325,6 +320,13 @@ impl LanguageModels {
         self.refresh_models_tx.send(()).ok();
     }
 
+    fn available_providers(cx: &App) -> impl Iterator<Item = Arc<dyn LanguageModelProvider>> + '_ {
+        LanguageModelRegistry::read_global(cx)
+            .visible_providers()
+            .into_iter()
+            .filter(move |provider| provider.is_authenticated(cx))
+    }
+
     fn watch(&self) -> watch::Receiver<()> {
         self.refresh_models_rx.clone()
     }
@@ -355,7 +357,7 @@ impl LanguageModels {
         }
     }
 
-    fn model_id(model: &LanguageModel) -> AgentModelId {
+    pub(crate) fn model_id(model: &LanguageModel) -> AgentModelId {
         AgentModelId::new(format!("{}/{}", model.provider_id().0, model.id().0))
     }
 
@@ -799,6 +801,10 @@ impl NativeAgent {
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
         let parent_session_id = thread.parent_thread_id();
+        let parent_thread = parent_session_id
+            .as_ref()
+            .and_then(|session_id| self.sessions.get(session_id))
+            .map(|session| session.thread.clone());
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
         let scroll_position = thread.ui_scroll_position();
@@ -849,6 +855,18 @@ impl NativeAgent {
                 skill_body_resolver_for_project(project.clone(), self.fs.clone()),
             ));
         });
+
+        if let Some(parent_thread) = parent_thread {
+            parent_thread.update(cx, |parent, _| {
+                parent.register_subagent(thread_handle.downgrade());
+            });
+            thread_handle.update(cx, |thread, cx| {
+                let parent = parent_thread.read(cx);
+                let profile_id = parent.profile().clone();
+                let profile_was_downgraded = parent.profile_was_downgraded();
+                thread.inherit_parent_profile(profile_id, profile_was_downgraded, cx);
+            });
+        }
 
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
@@ -2746,10 +2764,7 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
     let registry = LanguageModelRegistry::read_global(cx);
     let default = registry.default_model();
     let mut models = Vec::new();
-    for provider in registry.visible_providers() {
-        if !provider.is_authenticated(cx) {
-            continue;
-        }
+    for provider in LanguageModels::available_providers(cx) {
         let provider_id = provider.id();
         for model in provider.provided_models(cx) {
             let id = format!("{}/{}", provider_id.0, model.id().0);
@@ -2760,6 +2775,8 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
                 id,
                 name: model.name().0,
                 is_default,
+                allowed_for_spawn_agent: None,
+                requires_approval_for_spawn_agent: None,
             });
         }
     }
@@ -3231,6 +3248,7 @@ impl acp_thread::AgentSessionSetTitle for NativeAgentSessionSetTitle {
     }
 }
 
+#[derive(Clone)]
 pub struct NativeThreadEnvironment {
     agent: WeakEntity<NativeAgent>,
     thread: WeakEntity<Thread>,
@@ -3238,25 +3256,66 @@ pub struct NativeThreadEnvironment {
 }
 
 impl NativeThreadEnvironment {
+    fn resolve_subagent_model(
+        &self,
+        model_id: Option<&AgentModelId>,
+        cx: &App,
+    ) -> Result<(Option<LanguageModelSelection>, LanguageModel)> {
+        let selection = model_id
+            .map(|model_id| subagent_model_id_to_selection(model_id, cx))
+            .or_else(|| {
+                agent_settings::AgentSettings::get_global(cx)
+                    .subagent_model
+                    .clone()
+            });
+        let model = if let Some(selection) = selection.as_ref() {
+            let model_id =
+                AgentModelId::new(format!("{}/{}", selection.provider.0, selection.model));
+            LanguageModels::available_providers(cx)
+                .find(|provider| provider.id().0.as_ref() == selection.provider.0)
+                .and_then(|provider| provider.provided_models(cx).into_iter()
+                    .find(|model| model.id().0.as_ref() == selection.model))
+                .ok_or_else(|| anyhow!(
+                    "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
+                ))?
+        } else {
+            self.thread
+                .read_with(cx, |thread, _| thread.model().cloned())?
+                .ok_or_else(|| anyhow!(NoModelConfiguredError))?
+        };
+        Ok((selection, model))
+    }
+
+    fn subagent_session(
+        &self,
+        session_id: &acp_v1::SessionId,
+        cx: &App,
+    ) -> Result<(Entity<Thread>, Entity<AcpThread>)> {
+        let parent_id = self.thread.read_with(cx, |thread, _| thread.id().clone())?;
+        self.agent.read_with(cx, |agent, cx| {
+            let session = agent
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
+            if session.thread.read(cx).parent_thread_id().as_ref() != Some(&parent_id) {
+                anyhow::bail!("Session {session_id} is not a subagent of this thread");
+            }
+            let acp_thread = session
+                .acp_thread
+                .upgrade()
+                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
+            Ok((session.thread.clone(), acp_thread))
+        })?
+    }
+
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
         model: Option<AgentModelId>,
+        approved_model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let model = if let Some(model_id) = model {
-            let available = self.agent.read_with(cx, |agent, _| {
-                agent.models.model_from_id(&model_id).is_some()
-            })?;
-            if !available {
-                anyhow::bail!(
-                    "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
-                );
-            }
-            Some(subagent_model_id_to_selection(&model_id, cx))
-        } else {
-            None
-        };
+        let (selection, model) = self.resolve_subagent_model(model.as_ref(), cx)?;
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
@@ -3271,11 +3330,36 @@ impl NativeThreadEnvironment {
             ));
         }
 
+        if approved_model
+            .as_ref()
+            .is_some_and(|approved| approved != &LanguageModels::model_id(&model))
+        {
+            anyhow::bail!(
+                "Subagent model changed while waiting for approval. Retry the spawn_agent call."
+            );
+        }
+        parent_thread.validate_subagent_model(&model, approved_model.as_ref(), cx)?;
+
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, model.as_ref(), cx);
+            let mut thread = Thread::new_subagent(&parent_thread_entity, selection.as_ref(), cx);
+            if let Some(model_id) = approved_model {
+                thread.approve_subagent_model(model_id);
+            }
             thread.set_title(label.into(), cx);
             thread
         });
+        let model_id = LanguageModels::model_id(&model);
+        if subagent_thread
+            .read(cx)
+            .model()
+            .map(LanguageModels::model_id)
+            .as_ref()
+            != Some(&model_id)
+        {
+            anyhow::bail!(
+                "Model {model_id} is unavailable. The subagent cannot substitute the parent model."
+            );
+        }
 
         let session_id = subagent_thread.read(cx).id().clone();
 
@@ -3312,19 +3396,29 @@ impl NativeThreadEnvironment {
     pub(crate) fn resume_subagent_thread(
         &self,
         session_id: acp_v1::SessionId,
+        approved_model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
-            let session = agent
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
-            let acp_thread = session
-                .acp_thread
-                .upgrade()
-                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
-            anyhow::Ok((session.thread.clone(), acp_thread))
-        })??;
+        let (subagent_thread, acp_thread) = self.subagent_session(&session_id, cx)?;
+        let parent = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?;
+        let parent_thread = parent.read(cx);
+        let model = subagent_thread
+            .read(cx)
+            .model()
+            .context("Subagent has no model")?;
+        parent_thread.validate_subagent_model(model, approved_model.as_ref(), cx)?;
+        subagent_thread.update(cx, |thread, cx| {
+            let parent = parent.read(cx);
+            let profile_id = parent.profile().clone();
+            let profile_was_downgraded = parent.profile_was_downgraded();
+            thread.inherit_parent_profile(profile_id, profile_was_downgraded, cx);
+            if let Some(model_id) = approved_model {
+                thread.approve_subagent_model(model_id);
+            }
+        });
 
         let depth = subagent_thread.read(cx).depth();
 
@@ -3464,21 +3558,91 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(
+    fn spawn_subagent(
         &self,
         label: String,
         model: Option<AgentModelId>,
+        session_id: Option<acp_v1::SessionId>,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, model, cx)
-    }
-
-    fn resume_subagent(
-        &self,
-        session_id: acp_v1::SessionId,
-        cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        self.resume_subagent_thread(session_id, cx)
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
+        let environment = self.clone();
+        cx.spawn(async move |cx| {
+            if session_id.is_some() && model.is_some() {
+                anyhow::bail!("model cannot be changed when resuming a subagent session");
+            }
+            let (selected_model, existing_approval, profile_id, permission) = cx.update(|cx| {
+                let parent = environment.thread.upgrade().context("Parent thread no longer exists")?;
+                let parent_thread = parent.read(cx);
+                let (selected_model, existing_approval) = if let Some(session_id) = session_id.as_ref() {
+                    let (thread, _) = environment.subagent_session(session_id, cx)?;
+                    let thread = thread.read(cx);
+                    let model = thread.model().cloned().context("Subagent has no model")?;
+                    let approval = (thread.profile() == parent_thread.profile())
+                        .then(|| thread.approved_subagent_model().cloned())
+                        .flatten();
+                    (model, approval)
+                } else {
+                    if parent_thread.depth() >= MAX_SUBAGENT_DEPTH {
+                        anyhow::bail!("Maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached");
+                    }
+                    (environment.resolve_subagent_model(model.as_ref(), cx)?.1, None)
+                };
+                let permission = parent_thread.subagent_model_permission(
+                    &LanguageModels::model_id(&selected_model), cx
+                );
+                anyhow::Ok((selected_model, existing_approval, parent_thread.profile().clone(), permission))
+            })?;
+            let model_id = LanguageModels::model_id(&selected_model);
+            let approved_model = match permission {
+                ToolPermissionDecision::Allow => existing_approval,
+                ToolPermissionDecision::Deny(reason) => anyhow::bail!(reason),
+                ToolPermissionDecision::Confirm if existing_approval.as_ref() == Some(&model_id) => existing_approval,
+                ToolPermissionDecision::Confirm => {
+                    let authorization = cx.update(|cx| event_stream.prompt_for_decision(
+                        Some(format!("Use subagent model {model_id}?")),
+                        Some(format!(
+                            "Model {model_id} is outside profile {profile_id}'s subagent allowlist. Allow it for this subagent session? Nested subagents need their own approval."
+                        )),
+                        vec![
+                            acp_v1::PermissionOption::new(
+                                acp_v1::PermissionOptionId::new("allow_subagent_model"),
+                                "Allow for this subagent session",
+                                acp_v1::PermissionOptionKind::AllowOnce,
+                            ),
+                            acp_v1::PermissionOption::new(
+                                acp_v1::PermissionOptionId::new("deny_subagent_model"),
+                                "Deny",
+                                acp_v1::PermissionOptionKind::RejectOnce,
+                            ),
+                        ],
+                        cx,
+                    ));
+                    let decision = futures::select_biased! {
+                        _ = event_stream.cancelled_by_user().fuse() => anyhow::bail!("Tool canceled by user"),
+                        decision = authorization.fuse() => decision?,
+                    };
+                    if decision.0.as_ref() != "allow_subagent_model" {
+                        anyhow::bail!("User denied subagent model {model_id}");
+                    }
+                    Some(model_id)
+                }
+            };
+            if event_stream.was_cancelled_by_user() {
+                anyhow::bail!("Tool canceled by user");
+            }
+            cx.update(|cx| {
+                let current_profile = environment.thread.read_with(cx, |thread, _| thread.profile().clone())?;
+                if current_profile != profile_id {
+                    anyhow::bail!("Subagent profile changed while waiting for approval. Retry the spawn_agent call.");
+                }
+                if let Some(session_id) = session_id {
+                    environment.resume_subagent_thread(session_id, approved_model, cx)
+                } else {
+                    environment.create_subagent_thread(label, model, approved_model, cx)
+                }
+            })
+        })
     }
 
     fn create_sibling_thread(
@@ -3506,13 +3670,29 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         let host = self
             .agent
             .read_with(cx, |agent, _| agent.sibling_thread_host())?;
-        if let Some(host) = host {
-            host.list_available_agents(cx)
+        let mut available = if let Some(host) = host {
+            host.list_available_agents(cx)?
         } else {
-            Ok(AvailableAgents {
+            AvailableAgents {
                 agents: vec![available_native_agent(cx)],
-            })
-        }
+            }
+        };
+        self.thread.read_with(cx, |thread, cx| {
+            for agent in &mut available.agents {
+                if !agent.is_native {
+                    continue;
+                }
+                for model in &mut agent.models {
+                    let permission =
+                        thread.subagent_model_permission(&AgentModelId::from(model.id.clone()), cx);
+                    model.allowed_for_spawn_agent =
+                        Some(matches!(permission, ToolPermissionDecision::Allow));
+                    model.requires_approval_for_spawn_agent =
+                        Some(matches!(permission, ToolPermissionDecision::Confirm));
+                }
+            }
+        })?;
+        Ok(available)
     }
 }
 
@@ -3967,6 +4147,809 @@ mod internal_tests {
         });
     }
 
+    struct SubagentModelPolicyTest {
+        agent: Entity<NativeAgent>,
+        parent: Entity<Thread>,
+        _acp_thread: Entity<AcpThread>,
+        environment: NativeThreadEnvironment,
+        provider: Arc<FakeLanguageModelProvider>,
+        preferred: LanguageModel,
+    }
+
+    impl SubagentModelPolicyTest {
+        async fn new(cx: &mut TestAppContext) -> Self {
+            let provider = init_test(cx);
+            let preferred = provider.model("preferred");
+            provider.model("alternate");
+            let (_, agent, _, acp_thread) = setup_native_agent_session(cx).await;
+            let parent = cx.update(|cx| {
+                native_thread_for_session(&agent, acp_thread.read(cx).session_id(), cx)
+            });
+            let environment = NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: parent.downgrade(),
+                acp_thread: acp_thread.downgrade(),
+            };
+            Self {
+                agent,
+                parent,
+                _acp_thread: acp_thread,
+                environment,
+                provider,
+                preferred,
+            }
+        }
+
+        fn configure(
+            &self,
+            allowed: Option<serde_json::Value>,
+            allow_override: bool,
+            preferred: Option<&str>,
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(|cx| {
+                let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+                let profile = settings
+                    .profiles
+                    .get_mut(self.parent.read(cx).profile())
+                    .expect("active profile");
+                profile.allowed_subagent_models = settings::SubagentModelAllowlist(allowed);
+                profile.allow_subagent_model_override = allow_override;
+                settings.subagent_model = preferred.map(|model| LanguageModelSelection {
+                    provider: LanguageModelProviderSetting("fake".into()),
+                    model: model.into(),
+                    enable_thinking: false,
+                    effort: None,
+                    speed: None,
+                });
+                agent_settings::AgentSettings::override_global(settings, cx);
+            });
+        }
+
+        fn spawn(
+            &self,
+            model: Option<&str>,
+            session_id: Option<acp_v1::SessionId>,
+            cx: &mut TestAppContext,
+        ) -> (
+            Task<Result<Rc<dyn SubagentHandle>>>,
+            ToolCallEventStreamReceiver,
+        ) {
+            let (events, receiver) = ToolCallEventStream::test();
+            let task = cx.update(|cx| {
+                self.environment.spawn_subagent(
+                    "Delegated task".into(),
+                    model.map(|model| AgentModelId::new(model.to_string())),
+                    session_id,
+                    events,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            (task, receiver)
+        }
+
+        fn thread(&self, handle: &Rc<dyn SubagentHandle>, cx: &App) -> Entity<Thread> {
+            native_thread_for_session(&self.agent, &handle.id(), cx)
+        }
+    }
+
+    struct SubagentModelDiscoveryHost;
+
+    impl SiblingThreadHost for SubagentModelDiscoveryHost {
+        fn create_sibling_thread(
+            &self,
+            _request: SiblingThreadRequest,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<SiblingThreadInfo>> {
+            Task::ready(Err(anyhow!("not used by model discovery")))
+        }
+
+        fn list_available_agents(&self, cx: &mut App) -> Result<AvailableAgents> {
+            Ok(AvailableAgents {
+                agents: vec![
+                    available_native_agent(cx),
+                    AvailableAgent {
+                        id: "external".into(),
+                        name: "External".into(),
+                        is_native: false,
+                        models: vec![AvailableModel {
+                            id: "external-model".into(),
+                            name: "External model".into(),
+                            is_default: true,
+                            allowed_for_spawn_agent: None,
+                            requires_approval_for_spawn_agent: None,
+                        }],
+                    },
+                ],
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_preserves_unrestricted_selection_and_preferred_default(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        for (allowed, allow_override, preferred, explicit, expected) in [
+            (None, false, None, None, "fake"),
+            (None, false, Some("preferred"), None, "preferred"),
+            (None, true, Some("preferred"), Some("fake/fake"), "fake"),
+            (
+                Some(json!(["fake/preferred"])),
+                false,
+                Some("preferred"),
+                None,
+                "preferred",
+            ),
+        ] {
+            test.configure(allowed, allow_override, preferred, cx);
+            let (spawn, _receiver) = test.spawn(explicit, None, cx);
+            let handle = spawn.await.expect("permitted model selection");
+            let thread = cx.update(|cx| test.thread(&handle, cx));
+            thread.read_with(cx, |thread, _| {
+                assert_eq!(
+                    thread.model().expect("subagent model").id().0.as_ref(),
+                    expected
+                );
+            });
+        }
+        assert!(test.provider.pending_completions().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_rejects_explicit_defaults_empty_and_invalid_policies(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        for (allowed, allow_override, preferred, explicit, error_fragment) in [
+            (
+                Some(json!(["fake/preferred"])),
+                false,
+                Some("preferred"),
+                Some("fake/fake"),
+                "not allowed",
+            ),
+            (
+                Some(json!(["fake/preferred"])),
+                false,
+                None,
+                None,
+                "not allowed",
+            ),
+            (
+                Some(json!(["fake/fake"])),
+                false,
+                Some("preferred"),
+                None,
+                "not allowed",
+            ),
+            (
+                Some(json!([])),
+                false,
+                Some("preferred"),
+                Some("fake/preferred"),
+                "not allowed",
+            ),
+            (
+                Some(json!(["fake/preferred", false])),
+                true,
+                Some("preferred"),
+                None,
+                "Invalid subagent model policy",
+            ),
+            (None, false, Some("missing"), None, "unavailable"),
+        ] {
+            test.configure(allowed, allow_override, preferred, cx);
+            let before = test.agent.read_with(cx, |agent, _| agent.sessions.len());
+            let (spawn, _receiver) = test.spawn(explicit, None, cx);
+            let error = spawn.await.err().expect("model policy rejection");
+            assert!(error.to_string().contains(error_fragment), "{error}");
+            assert_eq!(
+                test.agent.read_with(cx, |agent, _| agent.sessions.len()),
+                before
+            );
+            assert!(test.provider.pending_completions().is_empty());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_checks_live_availability_before_using_a_preference(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(None, false, Some("preferred"), cx);
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.set_builtin_provider_hiding_fn(Box::new(|id| {
+                    (id == "fake").then_some("fake-extension")
+                }));
+                registry.extension_installed("fake-extension".into(), cx);
+            });
+            test.agent.update(cx, |agent, _| {
+                agent.models.models.insert(
+                    LanguageModels::model_id(&test.preferred),
+                    test.preferred.clone(),
+                );
+            });
+        });
+        let before = test.agent.read_with(cx, |agent, _| agent.sessions.len());
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        assert!(
+            spawn
+                .await
+                .err()
+                .expect("hidden preferred provider")
+                .to_string()
+                .contains("unavailable")
+        );
+        assert_eq!(
+            test.agent.read_with(cx, |agent, _| agent.sessions.len()),
+            before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_matches_provider_and_reports_discovery_eligibility(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        let other = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("other".to_string()),
+            LanguageModelProviderName::from("Other".to_string()),
+        ));
+        other.model("preferred");
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| registry.register_provider(other, cx));
+            test.agent
+                .update(cx, |agent, cx| agent.models.refresh_list(cx));
+        });
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        let (spawn, _receiver) = test.spawn(Some("other/preferred"), None, cx);
+        assert!(
+            spawn
+                .await
+                .err()
+                .expect("cross-provider rejection")
+                .to_string()
+                .contains("not allowed")
+        );
+
+        for with_host in [false, true] {
+            if with_host {
+                test.agent.update(cx, |agent, _| {
+                    agent.set_sibling_thread_host(Rc::new(SubagentModelDiscoveryHost));
+                });
+            }
+            for allow_override in [false, true] {
+                test.configure(
+                    Some(json!(["fake/preferred"])),
+                    allow_override,
+                    Some("preferred"),
+                    cx,
+                );
+                let available = cx
+                    .update(|cx| test.environment.list_available_agents(cx))
+                    .expect("native discovery with and without a sibling host");
+                let native = available
+                    .agents
+                    .iter()
+                    .find(|agent| agent.is_native)
+                    .expect("native agent");
+                for model in &native.models {
+                    let allowed = model.id == "fake/preferred";
+                    assert_eq!(model.allowed_for_spawn_agent, Some(allowed));
+                    assert_eq!(
+                        model.requires_approval_for_spawn_agent,
+                        Some(!allowed && allow_override)
+                    );
+                }
+                assert!(
+                    native
+                        .models
+                        .iter()
+                        .any(|model| model.id == "other/preferred")
+                );
+                for agent in available.agents.iter().filter(|agent| !agent.is_native) {
+                    for model in &agent.models {
+                        assert!(model.allowed_for_spawn_agent.is_none());
+                        assert!(model.requires_approval_for_spawn_agent.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_override_requires_approval_and_is_session_scoped(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(Some(json!(["fake/preferred"])), true, Some("preferred"), cx);
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let before = test.agent.read_with(cx, |agent, _| agent.sessions.len());
+        let (mut spawn, mut receiver) = test.spawn(Some("fake/alternate"), None, cx);
+        assert!((&mut spawn).now_or_never().is_none());
+        assert_eq!(
+            test.agent.read_with(cx, |agent, _| agent.sessions.len()),
+            before
+        );
+        let authorization = receiver.expect_authorization().await;
+        assert_eq!(
+            authorization.kind,
+            acp_thread::AuthorizationKind::ActionChoice
+        );
+        assert!(
+            authorization
+                .tool_call
+                .fields
+                .title
+                .as_ref()
+                .expect("approval title")
+                .contains("fake/alternate")
+        );
+        authorization
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v1::PermissionOptionId::new("allow_subagent_model"),
+                acp_v1::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve the exact model");
+        let handle = spawn.await.expect("approved subagent");
+        let thread = cx.update(|cx| test.thread(&handle, cx));
+        let send = cx.update(|cx| handle.send("task".into(), &cx.to_async()));
+        cx.run_until_parked();
+        let alternate = test.provider.model("alternate");
+        assert_eq!(test.provider.pending_completions_for(&alternate).len(), 1);
+        test.provider.send_last_text(&alternate, "done");
+        test.provider.end_last(&alternate);
+        assert_eq!(send.await.expect("approved model completes"), "done");
+
+        let (resume, _receiver) = test.spawn(None, Some(handle.id()), cx);
+        assert_eq!(
+            resume.await.expect("resume approved session").id(),
+            handle.id()
+        );
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.model().expect("resumed model").id(), alternate.id())
+        });
+
+        let selection = LanguageModelSelection {
+            provider: LanguageModelProviderSetting("fake".into()),
+            model: "alternate".into(),
+            enable_thinking: false,
+            effort: None,
+            speed: None,
+        };
+        let descendant = cx.new(|cx| Thread::new_subagent(&thread, Some(&selection), cx));
+        descendant.read_with(cx, |thread, cx| {
+            assert!(thread.approved_subagent_model().is_none());
+            assert!(
+                thread
+                    .validate_subagent_model(&alternate, thread.approved_subagent_model(), cx)
+                    .is_err()
+            );
+        });
+
+        let (spawn, mut receiver) = test.spawn(Some("fake/alternate"), None, cx);
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v1::PermissionOptionId::new("deny_subagent_model"),
+                acp_v1::PermissionOptionKind::RejectOnce,
+            ))
+            .expect("deny another session's exception");
+        assert!(spawn.await.is_err());
+
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        let (resume, _receiver) = test.spawn(None, Some(handle.id()), cx);
+        assert!(
+            resume.await.is_err(),
+            "disabling overrides revokes the exception"
+        );
+        let send = cx.update(|cx| handle.send("another task".into(), &cx.to_async()));
+        assert!(send.await.is_err());
+        assert!(test.provider.pending_completions().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_invalidates_idle_approval_on_parent_profile_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(Some(json!(["fake/preferred"])), true, Some("preferred"), cx);
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .get_mut(&agent_settings::AgentProfileId("ask".into()))
+                .expect("ask profile")
+                .default_model = Some(LanguageModelSelection {
+                provider: LanguageModelProviderSetting("fake".into()),
+                model: "preferred".into(),
+                enable_thinking: false,
+                effort: None,
+                speed: None,
+            });
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let (spawn, mut receiver) = test.spawn(Some("fake/alternate"), None, cx);
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v1::PermissionOptionId::new("allow_subagent_model"),
+                acp_v1::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve initial exception");
+        let handle = spawn.await.expect("approved child");
+        let child = cx.update(|cx| test.thread(&handle, cx));
+        let alternate = test.provider.model("alternate");
+        let send = cx.update(|cx| handle.send("finish this task".into(), &cx.to_async()));
+        cx.run_until_parked();
+        test.provider.send_last_text(&alternate, "done");
+        test.provider.end_last(&alternate);
+        send.await.expect("complete child turn");
+        assert!(
+            test.parent
+                .read_with(cx, |thread, cx| thread.running_subagent_ids(cx).is_empty())
+        );
+        let original_profile = test
+            .parent
+            .read_with(cx, |thread, _| thread.profile().clone());
+        test.parent.update(cx, |parent, cx| {
+            parent.set_profile(agent_settings::AgentProfileId("ask".into()), cx);
+        });
+        child.read_with(cx, |thread, _| {
+            assert_eq!(thread.profile().as_str(), "ask");
+            assert!(thread.approved_subagent_model().is_none());
+            assert_eq!(
+                thread.model().expect("original child model").id(),
+                alternate.id()
+            );
+        });
+        test.parent.update(cx, |parent, cx| {
+            parent.set_profile(original_profile, cx);
+        });
+        let (mut resume, mut receiver) = test.spawn(None, Some(handle.id()), cx);
+        assert!(
+            (&mut resume).now_or_never().is_none(),
+            "resuming after a parent profile change must request approval again"
+        );
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v1::PermissionOptionId::new("allow_subagent_model"),
+                acp_v1::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve renewed exception");
+        assert_eq!(resume.await.expect("reapproved child").id(), handle.id());
+        child.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.model().expect("resumed child model").id(),
+                alternate.id()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_rechecks_queued_requests_after_parent_profile_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let restricted = settings
+                .profiles
+                .get_mut(&agent_settings::AgentProfileId("ask".into()))
+                .expect("ask profile");
+            restricted.allowed_subagent_models = settings::SubagentModelAllowlist(Some(json!([])));
+            restricted.allow_subagent_model_override = false;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        let handle = spawn.await.expect("initial allowed child");
+        let child = cx.update(|cx| test.thread(&handle, cx));
+        let send = cx.update(|cx| {
+            let send = handle.send("queued task".into(), &cx.to_async());
+            test.parent.update(cx, |parent, cx| {
+                parent.set_profile(agent_settings::AgentProfileId("ask".into()), cx);
+            });
+            send
+        });
+        cx.run_until_parked();
+        assert!(
+            test.provider.pending_completions().is_empty(),
+            "profile changes must block queued requests before a provider call"
+        );
+        assert!(
+            send.await.is_err(),
+            "the newly restricted request must fail"
+        );
+        child.read_with(cx, |thread, _| assert_eq!(thread.profile().as_str(), "ask"));
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_allows_inflight_requests_to_finish_after_profile_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let restricted = settings
+                .profiles
+                .get_mut(&agent_settings::AgentProfileId("ask".into()))
+                .expect("ask profile");
+            restricted.allowed_subagent_models = settings::SubagentModelAllowlist(Some(json!([])));
+            restricted.allow_subagent_model_override = false;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        let handle = spawn.await.expect("initial allowed child");
+        let send = cx.update(|cx| handle.send("finish this task".into(), &cx.to_async()));
+        cx.run_until_parked();
+        assert_eq!(
+            test.provider.pending_completions_for(&test.preferred).len(),
+            1
+        );
+        test.parent.update(cx, |parent, cx| {
+            parent.set_profile(agent_settings::AgentProfileId("ask".into()), cx);
+        });
+        test.provider.send_last_text(&test.preferred, "done");
+        test.provider.end_last(&test.preferred);
+        assert_eq!(send.await.expect("inflight request completes"), "done");
+        let send = cx.update(|cx| handle.send("another task".into(), &cx.to_async()));
+        assert!(
+            send.await.is_err(),
+            "subsequent requests use the new policy"
+        );
+        assert!(test.provider.pending_completions().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_revalidates_after_override_approval(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        for (allow_override, preferred_model) in [(false, "alternate"), (true, "preferred")] {
+            test.configure(Some(json!(["fake/preferred"])), true, Some("alternate"), cx);
+            let before = test.agent.read_with(cx, |agent, _| agent.sessions.len());
+            let (spawn, mut receiver) = test.spawn(None, None, cx);
+            let authorization = receiver.expect_authorization().await;
+            test.configure(
+                Some(json!(["fake/preferred"])),
+                allow_override,
+                Some(preferred_model),
+                cx,
+            );
+            authorization
+                .response
+                .send(acp_thread::SelectedPermissionOutcome::new(
+                    acp_v1::PermissionOptionId::new("allow_subagent_model"),
+                    acp_v1::PermissionOptionKind::AllowOnce,
+                ))
+                .expect("answer the pending approval");
+            assert!(
+                spawn.await.is_err(),
+                "approval must not bypass a changed model or override setting"
+            );
+            assert_eq!(
+                test.agent.read_with(cx, |agent, _| agent.sessions.len()),
+                before
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_cancels_pending_override(cx: &mut TestAppContext) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(Some(json!(["fake/preferred"])), true, Some("preferred"), cx);
+        let before = test.agent.read_with(cx, |agent, _| agent.sessions.len());
+        let (events, mut receiver, mut cancellation) =
+            ToolCallEventStream::test_with_cancellation();
+        let spawn = cx.update(|cx| {
+            test.environment.spawn_subagent(
+                "task".into(),
+                Some(AgentModelId::new("fake/alternate")),
+                None,
+                events,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let _authorization = receiver.expect_authorization().await;
+        ToolCallEventStream::signal_cancellation_with_sender(&mut cancellation);
+        assert!(
+            spawn
+                .await
+                .err()
+                .expect("cancel pending override")
+                .to_string()
+                .contains("canceled")
+        );
+        assert_eq!(
+            test.agent.read_with(cx, |agent, _| agent.sessions.len()),
+            before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_rechecks_resumed_sessions_and_parent_ownership(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        let (spawn, _receiver) = test.spawn(Some("fake/alternate"), None, cx);
+        let handle = spawn.await.expect("unrestricted initial spawn");
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        let (resume, _receiver) = test.spawn(None, Some(handle.id()), cx);
+        assert!(
+            resume
+                .await
+                .err()
+                .expect("tightened resume policy")
+                .to_string()
+                .contains("not allowed")
+        );
+        let parent_id = test.parent.read_with(cx, |thread, _| thread.id().clone());
+        let (resume, _receiver) = test.spawn(None, Some(parent_id), cx);
+        assert!(
+            resume
+                .await
+                .err()
+                .expect("root is not a subagent")
+                .to_string()
+                .contains("not a subagent")
+        );
+        let child = cx.update(|cx| test.thread(&handle, cx));
+        let child_environment = NativeThreadEnvironment {
+            agent: test.agent.downgrade(),
+            thread: child.downgrade(),
+            acp_thread: test._acp_thread.downgrade(),
+        };
+        assert!(
+            cx.update(|cx| child_environment.resume_subagent_thread(handle.id(), None, cx))
+                .err()
+                .expect("cannot resume another caller's session")
+                .to_string()
+                .contains("not a subagent")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_blocks_propagated_parent_models_and_refusal_fallback(
+        cx: &mut TestAppContext,
+    ) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(Some(json!(["fake/fake"])), false, None, cx);
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        let handle = spawn.await.expect("allowed parent inheritance");
+        let child = cx.update(|cx| test.thread(&handle, cx));
+        test.parent.update(cx, |parent, cx| {
+            parent.register_running_subagent(child.downgrade());
+            parent.set_model(test.preferred.clone(), cx);
+        });
+        let send = cx.update(|cx| handle.send("task".into(), &cx.to_async()));
+        assert!(send.await.is_err());
+        assert!(test.provider.pending_completions().is_empty());
+
+        let preferred = test.provider.update_model("preferred", |model| {
+            model.refusal_fallback_model_id = Some("alternate");
+        });
+        test.agent
+            .update(cx, |agent, cx| agent.models.refresh_list(cx));
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        let handle = spawn.await.expect("allowed preferred model");
+        let send = cx.update(|cx| handle.send("task".into(), &cx.to_async()));
+        cx.run_until_parked();
+        test.provider.send_last_event(
+            &preferred,
+            LanguageModelCompletionEvent::Stop(language_model::StopReason::Refusal),
+        );
+        test.provider.end_last(&preferred);
+        assert!(
+            send.await
+                .err()
+                .expect("disallowed refusal fallback")
+                .to_string()
+                .contains("not allowed")
+        );
+        assert!(test.provider.pending_completions().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_subagent_model_policy_blocks_auxiliary_requests(cx: &mut TestAppContext) {
+        let test = SubagentModelPolicyTest::new(cx).await;
+        test.configure(
+            Some(json!(["fake/preferred"])),
+            false,
+            Some("preferred"),
+            cx,
+        );
+        let (spawn, _receiver) = test.spawn(None, None, cx);
+        let handle = spawn.await.expect("allowed preferred model");
+        let child = cx.update(|cx| test.thread(&handle, cx));
+        let send = cx.update(|cx| handle.send("task".into(), &cx.to_async()));
+        cx.run_until_parked();
+        test.provider.send_last_text(&test.preferred, "done");
+        test.provider.end_last(&test.preferred);
+        send.await.expect("complete the subagent turn");
+        let alternate = test.provider.model("alternate");
+        let summary = child.update(cx, |thread, cx| {
+            thread.set_summarization_model(Some(alternate.clone()), cx);
+            thread.summary(cx)
+        });
+        assert!(summary.await.is_none());
+        child.update(cx, |thread, cx| {
+            thread.regenerate_title(cx);
+        });
+        cx.run_until_parked();
+        assert!(child.read_with(cx, |thread, _| thread.has_failed_title_generation()));
+
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.set_compaction_model(Some(alternate), cx);
+            })
+        });
+        let mut events = child
+            .update(cx, |thread, cx| {
+                thread.compact(ClientUserMessageId::new(), cx)
+            })
+            .expect("start manual compaction");
+        let mut rejected = false;
+        while let Some(event) = events.next().await {
+            if let Err(error) = event {
+                assert!(error.to_string().contains("not allowed"));
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "compaction must reject the disallowed model");
+        assert!(test.provider.pending_completions().is_empty());
+    }
+
     #[gpui::test]
     async fn test_explicit_subagent_model_preserves_configured_settings(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4020,6 +5003,7 @@ mod internal_tests {
                 environment.create_subagent_thread(
                     "subagent".to_string(),
                     Some(AgentModelId::from("fake-corp/subagent-model".to_string())),
+                    None,
                     cx,
                 )
             })
@@ -7538,10 +8522,10 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("first".to_string(), None, None, cx))
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("second".to_string(), None, None, cx))
             .unwrap();
         cx.run_until_parked();
 

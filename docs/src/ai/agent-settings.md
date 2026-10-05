@@ -156,6 +156,30 @@ Zed supports feature-specific model settings for Inline Assistant, Git commit ge
 
 See [LLM Providers](./llm-providers.md) for model access, and [All Settings](../reference/all-settings.md) for the complete settings reference.
 
+### Subagent Model {#subagent-model}
+
+Open your settings file with {#action zed::OpenSettingsFile} and set
+`agent.subagent_model` to prefer a model for delegated tasks:
+
+```json [settings]
+{
+  "agent": {
+    "subagent_model": {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5"
+    }
+  }
+}
+```
+
+An explicit `spawn_agent.model` takes precedence over this setting. When neither
+is specified, the subagent inherits the parent model. A configured model must be
+available; Zed fails the spawn instead of substituting another model.
+
+This setting selects a preferred model. To enforce which models subagents may
+use, configure an [allowlist on the active
+profile](./agent-profiles.md#subagent-model-restrictions).
+
 ## Model Temperature {#model-temperature}
 
 Most Zed AI features use the selected model's default generation behavior.

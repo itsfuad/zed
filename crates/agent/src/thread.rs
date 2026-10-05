@@ -2,8 +2,8 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    GoToDefinitionTool, GrepTool, LanguageModels, ListAgentsAndModelsTool, ListDirectoryTool,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
@@ -788,22 +788,14 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(
+    fn spawn_subagent(
         &self,
         label: String,
         model: Option<AgentModelId>,
+        session_id: Option<acp::SessionId>,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>>;
-
-    fn resume_subagent(
-        &self,
-        _session_id: acp::SessionId,
-        _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        Err(anyhow::anyhow!(
-            "Resuming subagent sessions is not supported"
-        ))
-    }
+    ) -> Task<Result<Rc<dyn SubagentHandle>>>;
 
     /// Creates an independent sibling thread visible in the agent sidebar.
     /// Unlike subagents, sibling threads are first-class threads that persist
@@ -896,6 +888,12 @@ pub struct AvailableModel {
     pub name: SharedString,
     /// Whether this is the default model for the agent.
     pub is_default: bool,
+    /// Whether this model is permitted for native subagents without an override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_for_spawn_agent: Option<bool>,
+    /// Whether a native subagent may request user approval to use this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_approval_for_spawn_agent: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1323,7 +1321,11 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    // Idle children must still inherit policy changes and lose approved exceptions.
+    subagents: Vec<WeakEntity<Thread>>,
     inherits_parent_model_settings: bool,
+    // Exceptions belong to one model, profile, and live session, not descendants.
+    approved_subagent_model: Option<(AgentProfileId, AgentModelId)>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     /// Sandbox permissions the user approved "for the rest of the thread".
     /// Shared with each tool call's event stream so repeated requests for
@@ -1470,7 +1472,9 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            subagents: Vec::new(),
             inherits_parent_model_settings: true,
+            approved_subagent_model: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
         }
@@ -1486,9 +1490,93 @@ impl Thread {
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
-        self.profile_id = parent.profile_id.clone();
-        self.profile_downgraded_for_restricted_workspace =
-            parent.profile_downgraded_for_restricted_workspace;
+        let profile_id = parent.profile_id.clone();
+        let profile_was_downgraded = parent.profile_downgraded_for_restricted_workspace;
+        self.inherit_parent_profile(profile_id, profile_was_downgraded, cx);
+    }
+
+    pub(crate) fn inherit_parent_profile(
+        &mut self,
+        profile_id: AgentProfileId,
+        profile_was_downgraded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_id != profile_id {
+            self.approved_subagent_model = None;
+        }
+        self.profile_id = profile_id;
+        self.profile_downgraded_for_restricted_workspace = profile_was_downgraded;
+        for subagent in &self.subagents {
+            if let Some(subagent) = subagent.upgrade() {
+                subagent.update(cx, |thread, cx| {
+                    thread.inherit_parent_profile(
+                        self.profile_id.clone(),
+                        profile_was_downgraded,
+                        cx,
+                    );
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn subagent_model_permission(
+        &self,
+        model_id: &AgentModelId,
+        cx: &App,
+    ) -> ToolPermissionDecision {
+        let Some(profile) = AgentSettings::get_global(cx).profiles.get(&self.profile_id) else {
+            return ToolPermissionDecision::Deny(format!(
+                "Subagent profile {} is unavailable",
+                self.profile_id
+            ));
+        };
+        match profile.allowed_subagent_models.allows(model_id.as_ref()) {
+            Ok(true) => ToolPermissionDecision::Allow,
+            Ok(false) if profile.allow_subagent_model_override => ToolPermissionDecision::Confirm,
+            Ok(false) => ToolPermissionDecision::Deny(format!(
+                "Model {model_id} is not allowed for subagents in profile {}. Call list_agents_and_models to inspect permitted models.",
+                self.profile_id
+            )),
+            Err(error) => ToolPermissionDecision::Deny(format!(
+                "Invalid subagent model policy in profile {}: {error}",
+                self.profile_id
+            )),
+        }
+    }
+
+    pub(crate) fn validate_subagent_model(
+        &self,
+        model: &LanguageModel,
+        approved_model: Option<&AgentModelId>,
+        cx: &App,
+    ) -> Result<()> {
+        let model_id = LanguageModels::model_id(model);
+        match self.subagent_model_permission(&model_id, cx) {
+            ToolPermissionDecision::Allow => Ok(()),
+            ToolPermissionDecision::Confirm if approved_model == Some(&model_id) => Ok(()),
+            ToolPermissionDecision::Confirm => Err(anyhow!(
+                "Model {model_id} requires user approval for this subagent session"
+            )),
+            ToolPermissionDecision::Deny(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    pub(crate) fn approved_subagent_model(&self) -> Option<&AgentModelId> {
+        self.approved_subagent_model
+            .as_ref()
+            .and_then(|(profile_id, model_id)| (profile_id == &self.profile_id).then_some(model_id))
+    }
+
+    pub(crate) fn approve_subagent_model(&mut self, model_id: AgentModelId) {
+        self.approved_subagent_model = Some((self.profile_id.clone(), model_id));
+    }
+
+    fn validate_request_model(&self, model: &LanguageModel, cx: &App) -> Result<()> {
+        if self.is_subagent() {
+            self.validate_subagent_model(model, self.approved_subagent_model(), cx)?;
+        }
+        Ok(())
     }
 
     fn apply_model_selection(
@@ -1848,7 +1936,9 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            subagents: Vec::new(),
             inherits_parent_model_settings: true,
+            approved_subagent_model: None,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
@@ -2308,17 +2398,33 @@ impl Thread {
         }
 
         self.profile_id = profile_id.clone();
+        self.approved_subagent_model = None;
 
         // Swap to the profile's preferred model when available.
         if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
             self.set_model(model, cx);
         }
 
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| thread.set_profile(profile_id.clone(), cx))
-                .ok();
+        for subagent in &self.subagents {
+            if let Some(subagent) = subagent.upgrade() {
+                let is_running = self
+                    .running_subagents
+                    .iter()
+                    .any(|running| running.entity_id() == subagent.entity_id());
+                subagent.update(cx, |thread, cx| {
+                    if is_running {
+                        thread.set_profile(profile_id.clone(), cx);
+                    } else {
+                        thread.inherit_parent_profile(
+                            profile_id.clone(),
+                            self.profile_downgraded_for_restricted_workspace,
+                            cx,
+                        );
+                    }
+                });
+            }
         }
+        cx.notify();
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
@@ -2888,6 +2994,7 @@ impl Thread {
                     .clone()
                     .or_else(|| this.model().cloned())
                     .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+                this.validate_request_model(&model, cx)?;
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
@@ -3071,6 +3178,7 @@ impl Thread {
                 })?;
 
                 if let Some(fallback) = maybe_fallback {
+                    this.read_with(cx, |this, cx| this.validate_request_model(&fallback, cx))??;
                     log::info!("Refusal fallback: retrying with {}", fallback.id().0);
                     let fallback_name = fallback.name().0.clone();
                     this.update(cx, |this, cx| {
@@ -3236,6 +3344,7 @@ impl Thread {
             acp_thread::ContextCompactionStatus::InProgress,
         );
         let result: Result<ControlFlow<()>> = async {
+            this.read_with(cx, |this, cx| this.validate_request_model(&model, cx))??;
             let provider =
                 cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
             let stream = futures::select! {
@@ -3934,6 +4043,9 @@ impl Thread {
         let task = cx
             .spawn(async move |this, cx| {
                 let mut summary = String::new();
+                this.read_with(cx, |this, cx| this.validate_request_model(&model, cx))
+                    .log_err()?
+                    .log_err()?;
                 let provider = cx
                     .update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))
                     .log_err()?;
@@ -4013,7 +4125,8 @@ impl Thread {
         let temperature = AgentSettings::temperature_for_model(&model, cx);
         let request = build_thread_title_request(&self.id, &self.messages, temperature);
 
-        let title_generation = cx.spawn(async move |_this, cx| {
+        let title_generation = cx.spawn(async move |this, cx| {
+            this.read_with(cx, |this, cx| this.validate_request_model(&model, cx))??;
             stream_thread_title(model, request, cx)
                 .await
                 .context("failed to generate thread title")
@@ -4326,7 +4439,20 @@ impl Thread {
         self.tools.contains_key(name)
     }
 
+    pub(crate) fn register_subagent(&mut self, subagent: WeakEntity<Thread>) {
+        self.subagents
+            .retain(|existing| existing.upgrade().is_some());
+        if !self
+            .subagents
+            .iter()
+            .any(|existing| existing.entity_id() == subagent.entity_id())
+        {
+            self.subagents.push(subagent);
+        }
+    }
+
     pub(crate) fn register_running_subagent(&mut self, subagent: WeakEntity<Thread>) {
+        self.register_subagent(subagent.clone());
         self.running_subagents.push(subagent);
     }
 

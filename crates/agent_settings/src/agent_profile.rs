@@ -7,7 +7,7 @@ use fs::Fs;
 use gpui::{App, SharedString};
 use settings::{
     AgentProfileContent, ContextServerPresetContent, LanguageModelSelection, Settings as _,
-    SettingsContent, SettingsStore, update_settings_file,
+    SettingsContent, SettingsStore, SubagentModelAllowlist, update_settings_file,
 };
 use util::ResultExt as _;
 
@@ -77,6 +77,13 @@ impl AgentProfile {
             enable_all_context_servers,
             context_servers,
             default_model,
+            allowed_subagent_models: base_profile
+                .as_ref()
+                .map(|profile| profile.allowed_subagent_models.clone())
+                .unwrap_or_default(),
+            allow_subagent_model_override: base_profile
+                .as_ref()
+                .is_some_and(|profile| profile.allow_subagent_model_override),
         };
 
         update_settings_file(fs, cx, {
@@ -109,6 +116,8 @@ pub struct AgentProfileSettings {
     pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
     /// Default language model to apply when this profile becomes active.
     pub default_model: Option<LanguageModelSelection>,
+    pub allowed_subagent_models: SubagentModelAllowlist,
+    pub allow_subagent_model_override: bool,
 }
 
 impl AgentProfileSettings {
@@ -183,6 +192,8 @@ impl AgentProfileSettings {
                     })
                     .collect(),
                 default_model: self.default_model.clone(),
+                allowed_subagent_models: self.allowed_subagent_models.clone(),
+                allow_subagent_model_override: Some(self.allow_subagent_model_override),
             },
         );
 
@@ -198,6 +209,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             enable_all_context_servers,
             context_servers,
             default_model,
+            allowed_subagent_models,
+            allow_subagent_model_override,
         } = content;
 
         Self {
@@ -209,6 +222,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
                 .map(|(server_id, preset)| (server_id, preset.into()))
                 .collect(),
             default_model,
+            allowed_subagent_models,
+            allow_subagent_model_override: allow_subagent_model_override.unwrap_or(false),
         }
     }
 }
@@ -230,6 +245,59 @@ impl From<settings::ContextServerPresetContent> for ContextServerPreset {
 mod tests {
     use super::*;
 
+    #[test]
+    fn subagent_model_policy_roundtrips_through_profile_settings() {
+        let content: AgentProfileContent = serde_json::from_value(serde_json::json!({
+            "name": "Controlled",
+            "allowed_subagent_models": ["fake/preferred"],
+            "allow_subagent_model_override": true,
+        }))
+        .expect("deserialize profile policy");
+        let profile = AgentProfileSettings::from(content.clone());
+        assert!(profile.allow_subagent_model_override);
+        assert!(
+            profile
+                .allowed_subagent_models
+                .allows("fake/preferred")
+                .expect("valid policy")
+        );
+        assert!(
+            !profile
+                .allowed_subagent_models
+                .allows("fake/parent")
+                .expect("valid policy")
+        );
+        let mut settings = SettingsContent::default();
+        profile
+            .save_to_settings(AgentProfileId("controlled".into()), &mut settings)
+            .expect("save profile policy");
+        let saved = settings
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.profiles.as_ref())
+            .and_then(|profiles| profiles.get("controlled"))
+            .expect("saved profile");
+        assert_eq!(
+            saved.allowed_subagent_models,
+            content.allowed_subagent_models
+        );
+        assert_eq!(saved.allow_subagent_model_override, Some(true));
+
+        let unrestricted = AgentProfileSettings::from(
+            serde_json::from_value::<AgentProfileContent>(
+                serde_json::json!({"name": "Unrestricted"}),
+            )
+            .expect("legacy profile"),
+        );
+        assert!(!unrestricted.allow_subagent_model_override);
+        assert!(
+            unrestricted
+                .allowed_subagent_models
+                .allows("fake/parent")
+                .expect("unrestricted policy")
+        );
+    }
+
     fn profile(
         enable_all_context_servers: bool,
         context_servers: IndexMap<Arc<str>, ContextServerPreset>,
@@ -240,6 +308,8 @@ mod tests {
             enable_all_context_servers,
             context_servers,
             default_model: None,
+            allowed_subagent_models: SubagentModelAllowlist::default(),
+            allow_subagent_model_override: false,
         }
     }
 
@@ -292,6 +362,23 @@ mod tests {
         assert!(AgentProfileSettings::is_unmodified_default(&minimal, cx));
         // Custom (non-built-in) ids are never considered unmodified defaults.
         assert!(!AgentProfileSettings::is_unmodified_default(&custom, cx));
+
+        let mut content = SettingsContent::default();
+        AgentSettings::get_global(cx)
+            .profiles
+            .get(&write)
+            .expect("default write profile")
+            .save_to_settings(write.clone(), &mut content)
+            .expect("save default write profile");
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    &serde_json::to_string(&content).expect("serialize default profile"),
+                    cx,
+                )
+                .expect("materialize default profile");
+        });
+        assert!(AgentProfileSettings::is_unmodified_default(&write, cx));
 
         // The user customizes the `write` profile; `minimal` stays untouched.
         SettingsStore::update_global(cx, |store, cx| {

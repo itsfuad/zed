@@ -37,6 +37,7 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - Omit `model` to use the user's configured subagent model, or the parent model when no subagent model is configured.
 /// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
 /// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
+/// - Profile allowlists apply to explicit selections and default models. Models outside the allowlist require user approval when overrides are enabled; otherwise the call fails.
 ///
 /// ### Output
 /// - You will receive only the agent's final message as output.
@@ -180,22 +181,30 @@ impl AgentTool for SpawnAgentTool {
                 session_id,
                 model,
             } = input;
-            let (subagent, mut session_info) = cx.update(|cx| {
-                let subagent = match (session_id, model) {
-                    (Some(_), Some(_)) => Err(anyhow::anyhow!(
-                        "model cannot be changed when resuming a subagent session"
-                    )),
-                    (Some(session_id), None) => self.environment.resume_subagent(session_id, cx),
-                    (None, model) => {
-                        self.environment
-                            .create_subagent(label, model.map(AgentModelId::from), cx)
-                    }
-                };
-                let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
+            if session_id.is_some() && model.is_some() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: None,
+                    error: "model cannot be changed when resuming a subagent session".into(),
+                    session_info: None,
+                });
+            }
+            let subagent = cx
+                .update(|cx| {
+                    self.environment.spawn_subagent(
+                        label,
+                        model.map(AgentModelId::from),
+                        session_id,
+                        event_stream.clone(),
+                        cx,
+                    )
+                })
+                .await
+                .map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
                     error: err.to_string(),
                     session_info: None,
                 })?;
+            let mut session_info = cx.update(|cx| {
                 let session_info = SubagentSessionInfo {
                     session_id: subagent.id(),
                     message_start_index: subagent.num_entries(cx),
@@ -211,8 +220,8 @@ impl AgentTool for SpawnAgentTool {
                     )])),
                 );
 
-                Ok((subagent, session_info))
-            })?;
+                session_info
+            });
 
             let send_result = subagent.send(message, cx).await;
 

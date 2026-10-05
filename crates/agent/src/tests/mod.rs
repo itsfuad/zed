@@ -246,18 +246,23 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(
+    fn spawn_subagent(
         &self,
         _label: String,
         model: Option<AgentModelId>,
+        session_id: Option<acp::SessionId>,
+        _event_stream: ToolCallEventStream,
         _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
+        if session_id.is_some() {
+            return Task::ready(Err(anyhow!("Resuming subagent sessions is not supported")));
+        }
         self.subagent_models.borrow_mut().push(model);
-        Ok(self
+        Task::ready(Ok(self
             .subagent_handle
             .clone()
             .expect("Subagent handle not available on FakeThreadEnvironment")
-            as Rc<dyn SubagentHandle>)
+            as Rc<dyn SubagentHandle>))
     }
 }
 
@@ -293,12 +298,14 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(
+    fn spawn_subagent(
         &self,
         _label: String,
         _model: Option<AgentModelId>,
+        _session_id: Option<acp::SessionId>,
+        _event_stream: ToolCallEventStream,
         _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
         unimplemented!()
     }
 }
@@ -7042,7 +7049,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
     let handle = cx
         .update(|cx| {
             test.environment
-                .resume_subagent_thread(test.handle.id(), cx)
+                .resume_subagent_thread(test.handle.id(), None, cx)
         })
         .unwrap();
     assert_eq!(handle.id(), test.handle.id());
@@ -9325,7 +9332,7 @@ impl SubagentCompactionTest {
             acp_thread: acp_thread.downgrade(),
         };
         let handle = cx
-            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, cx))
+            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, None, cx))
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&handle.id()).unwrap().thread.clone()

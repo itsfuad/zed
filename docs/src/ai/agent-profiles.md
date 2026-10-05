@@ -5,9 +5,9 @@ description: Configure Zed Agent profiles for model selection, built-in tool ava
 
 # Agent Profiles
 
-Agent profiles control how the [Zed Agent](./zed-agent.md) behaves in a thread. A profile can set a default model and choose which [built-in tools](./tools.md) and MCP tools are available.
+Agent profiles control how the [Zed Agent](./zed-agent.md) behaves in a thread. A profile can set a default model, restrict subagent models, and choose which [built-in tools](./tools.md) and MCP tools are available.
 
-Profiles do not decide whether a tool call is allowed automatically. Use [Tool Permissions](./tool-permissions.md) to control allow, deny, and confirm behavior.
+Use [Tool Permissions](./tool-permissions.md) to control allow, deny, and confirm behavior for permission-gated tools. Subagent model restrictions are configured separately in the profile.
 
 ## Built-in Profiles {#built-in-profiles}
 
@@ -61,6 +61,67 @@ Profiles are stored under `agent.profiles` in your settings.
 ```
 
 The exact model IDs and provider IDs depend on your configured [LLM Providers](./llm-providers.md).
+
+## Subagent Model Restrictions {#subagent-model-restrictions}
+
+Set `allowed_subagent_models` on the active profile to control which models native
+subagents may use. Each entry is an exact `provider/model-id` from the native Zed
+agent entry returned by `list_agents_and_models`.
+
+Open your settings file with {#action zed::OpenSettingsFile}. For example, this
+configuration prefers Haiku for subagents and permits only that model:
+
+```json [settings]
+{
+  "agent": {
+    "subagent_model": {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5"
+    },
+    "profiles": {
+      "write": {
+        "name": "Write",
+        "allowed_subagent_models": ["anthropic/claude-haiku-4-5"],
+        "allow_subagent_model_override": false
+      }
+    }
+  }
+}
+```
+
+Replace the model ID with one available from your configured provider.
+
+- Omitting the allowlist permits all available models.
+- An empty list permits no models unless you enable and approve an exception.
+- A nonempty list permits only the listed provider/model combinations.
+- Malformed allowlists block subagent model use until you correct them.
+
+The allowlist applies to explicit `spawn_agent.model` selections, the configured
+`agent.subagent_model`, and inherited parent models. Zed applies the preferred
+subagent model when the tool omits `model`. A preferred model that is unavailable
+causes the call to fail instead of silently using the parent model.
+
+To prevent subagents from using the parent model, omit it from the allowlist and
+keep `allow_subagent_model_override` set to `false`. To require one specific
+model, configure it as `agent.subagent_model` and make it the only allowlist entry.
+
+### User-Approved Overrides {#subagent-model-overrides}
+
+Set `allow_subagent_model_override` to `true` to let a subagent request a model
+outside the allowlist. Zed asks for confirmation showing the exact provider/model
+ID. The default is `false`, which rejects outside-list models.
+
+Approval authorizes that model for the specific live subagent session, including
+follow-up messages. It does not authorize other sessions or descendants, and
+does not alter your settings. Changing the profile or reopening the session
+clears the approval. Setting the override flag to `false` blocks an outside-list
+model even if you previously approved it.
+
+Resumed sessions keep their model and are checked against the caller's current
+profile. Model restrictions are also checked before subsequent subagent requests,
+including refusal fallback, compaction, thread summaries, and title generation.
+Include configured compaction and summary models in the allowlist if you want to
+permit those requests. Requests already in progress can finish.
 
 ## Profiles vs. Tool Permissions {#profiles-vs-tool-permissions}
 

@@ -15,6 +15,9 @@ use crate::{AgentTool, AvailableAgents, ThreadEnvironment, ToolCallEventStream, 
 /// The result may include external agents. The `spawn_agent` tool creates a
 /// native Zed subagent, so its `model` must be an exact `models[].id` from the
 /// agent entry where `is_native` is `true`.
+/// Native models report `allowed_for_spawn_agent` and
+/// `requires_approval_for_spawn_agent` for the active profile. Prefer permitted
+/// models; request an approval-required model only when the user asks for it.
 ///
 /// Call this before either tool if you need to pick a specific agent or a
 /// non-default model (for example, to use a cheaper model for bulk work). If
