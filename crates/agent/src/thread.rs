@@ -77,6 +77,14 @@ pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permis
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
+fn ensure_subagents_enabled(cx: &App) -> Result<()> {
+    anyhow::ensure!(
+        AgentSettings::get_global(cx).subagents_enabled(),
+        "Subagents are turned off in the user's settings."
+    );
+    Ok(())
+}
+
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
     for character in tool_name.chars() {
@@ -1402,12 +1410,9 @@ impl Thread {
             outcomes: Vec::new(),
         });
         thread.inherit_parent_settings(parent_thread, cx);
-        let model_selection = model_selection
-            .cloned()
-            .or_else(|| AgentSettings::get_global(cx).subagent_model.clone());
         if let Some(model_selection) = model_selection {
             thread.inherits_parent_model_settings = false;
-            thread.apply_model_selection(&model_selection, cx);
+            thread.apply_model_selection(model_selection, cx);
         }
         thread
     }
@@ -2070,6 +2075,69 @@ impl Thread {
         self.model.as_model()
     }
 
+    /// Checks a model for a subagent of this thread against
+    /// `agent.allowed_subagent_models`.
+    pub(crate) fn ensure_subagent_model_permitted(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        cx: &App,
+    ) -> Result<()> {
+        let settings = AgentSettings::get_global(cx);
+        match settings.allowed_subagent_models {
+            settings::AllowedSubagentModels::Any => {}
+            settings::AllowedSubagentModels::NoModels => ensure_subagents_enabled(cx)?,
+            settings::AllowedSubagentModels::SameProvider => {
+                let parent_provider_id = self.model().map(|model| model.provider_id().0);
+                anyhow::ensure!(
+                    parent_provider_id.as_deref() == Some(provider_id),
+                    "Model {provider_id}/{model_id} is not permitted: the user's settings restrict subagents to this thread's provider ({}). Omit `model` to use the default subagent model.",
+                    parent_provider_id.as_deref().unwrap_or("none")
+                );
+            }
+            settings::AllowedSubagentModels::SelectedOnly => {
+                ensure_subagents_enabled(cx)?;
+                anyhow::ensure!(
+                    settings
+                        .selected_subagent_models
+                        .iter()
+                        .any(|selected| selected.matches_model(provider_id, model_id)),
+                    "Model {provider_id}/{model_id} is not permitted: the user's settings only allow [{}] for subagents.",
+                    itertools::join(&settings.selected_subagent_models, ", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The model settings for a subagent of this thread that was not given a
+    /// model. `None` means the subagent inherits this thread's model.
+    pub(crate) fn default_subagent_model(
+        &self,
+        cx: &App,
+    ) -> Result<Option<LanguageModelSelection>> {
+        ensure_subagents_enabled(cx)?;
+        let settings = AgentSettings::get_global(cx);
+        // A configured subagent model that `allowed_subagent_models` excludes
+        // is not used.
+        if let Some(selection) = settings.subagent_model.as_ref()
+            && self
+                .ensure_subagent_model_permitted(&selection.provider.0, &selection.model, cx)
+                .is_ok()
+        {
+            return Ok(Some(selection.clone()));
+        }
+        if let Some(model) = self.model() {
+            anyhow::ensure!(
+                self.ensure_subagent_model_permitted(&model.provider_id().0, &model.id().0, cx)
+                    .is_ok(),
+                "No default subagent model is permitted: the user's settings only allow [{}] for subagents. Set `model` to one of them.",
+                itertools::join(&settings.selected_subagent_models, ", ")
+            );
+        }
+        Ok(None)
+    }
+
     pub fn thread_model(&self) -> &ThreadModel {
         &self.model
     }
@@ -2102,10 +2170,15 @@ impl Thread {
         self.prompt_capabilities_tx.send(new_caps).log_err();
         cx.emit(ModelChanged);
 
+        // A running subagent keeps its current model when the new one is not
+        // permitted for subagents.
+        let is_permitted_for_subagents = self
+            .ensure_subagent_model_permitted(&model.provider_id().0, &model.id().0, cx)
+            .is_ok();
         for subagent in &self.running_subagents {
             subagent
                 .update(cx, |thread, cx| {
-                    if thread.inherits_parent_model_settings {
+                    if is_permitted_for_subagents && thread.inherits_parent_model_settings {
                         thread.set_model(model.clone(), cx);
                     }
                 })
@@ -2368,8 +2441,10 @@ impl Thread {
 
         self.profile_id = profile_id.clone();
 
-        // Swap to the profile's preferred model when available.
-        if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
+        // Subagents receive model changes through the parent's permission and inheritance checks.
+        if self.subagent_context.is_none()
+            && let Some(model) = Self::resolve_profile_model(&self.profile_id, cx)
+        {
             self.set_model(model, cx);
         }
 
@@ -3237,7 +3312,16 @@ impl Thread {
                             fallback_id
                         );
                     }
-                    found
+                    found.filter(|model| {
+                        this.subagent_context.is_none()
+                            || this
+                                .ensure_subagent_model_permitted(
+                                    &model.provider_id().0,
+                                    &model.id().0,
+                                    cx,
+                                )
+                                .is_ok()
+                    })
                 })?;
 
                 if let Some(fallback) = maybe_fallback {
@@ -4408,7 +4492,7 @@ impl Thread {
         Ok(request)
     }
 
-    fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+    pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -4425,11 +4509,15 @@ impl Thread {
         // of what the active profile enables.
         let is_restricted =
             TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx);
+        let subagents_enabled = AgentSettings::get_global(cx).subagents_enabled();
 
         let mut tools = self
             .tools
             .iter()
             .filter(|(_, tool)| !is_restricted || tool.allow_in_restricted_mode())
+            .filter(|(tool_name, _)| {
+                subagents_enabled || tool_name.as_ref() != SpawnAgentTool::NAME
+            })
             .filter_map(|(tool_name, tool)| {
                 let terminal_variant = matches!(
                     tool_name.as_ref(),
@@ -7289,7 +7377,7 @@ impl From<UserMessageContent> for acp_v2::ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::test_tools::EchoTool;
+    use crate::tests::{selected_subagent_model, test_tools::EchoTool};
     use agent_client_protocol::schema::MaybeUndefined;
     use gpui::TestAppContext;
     use language_model::fake_provider::FakeLanguageModelProvider;
@@ -9539,6 +9627,123 @@ mod tests {
             }
             subagents
         })
+    }
+
+    #[gpui::test]
+    async fn test_subagent_refusal_fallback_respects_allowed_models(cx: &mut TestAppContext) {
+        for (restriction, allow_fallback) in [
+            (settings::AllowedSubagentModels::SelectedOnly, false),
+            (settings::AllowedSubagentModels::SelectedOnly, true),
+            (settings::AllowedSubagentModels::Any, true),
+        ] {
+            let (parent, _event_stream, fake) = setup_thread_for_test(cx).await;
+            let model = fake.update_model("fake", |model| {
+                model.refusal_fallback_model_id = Some("fallback");
+            });
+            let fallback = fake.model("fallback");
+            let subagent = cx.update(|cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.allowed_subagent_models = restriction;
+                settings.selected_subagent_models = vec![selected_subagent_model("fake", "fake")];
+                if allow_fallback {
+                    settings
+                        .selected_subagent_models
+                        .push(selected_subagent_model("fake", "fallback"));
+                }
+                AgentSettings::override_global(settings, cx);
+                parent.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+                cx.new(|cx| Thread::new_subagent(&parent, None, cx))
+            });
+            let events = subagent
+                .update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            fake.send_last_event(
+                &model,
+                LanguageModelCompletionEvent::Stop(StopReason::Refusal(None)),
+            );
+            fake.end_last(&model);
+            cx.run_until_parked();
+
+            assert_eq!(
+                fake.pending_completions_for(&fallback).len(),
+                usize::from(allow_fallback)
+            );
+            if allow_fallback {
+                fake.send_last_event(
+                    &fallback,
+                    LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+                );
+                fake.end_last(&fallback);
+            }
+            let events = events.collect::<Vec<_>>().await;
+            let expected_stop = if allow_fallback {
+                acp_v2::StopReason::EndTurn
+            } else {
+                acp_v2::StopReason::Refusal
+            };
+            assert!(events.iter().any(|event| {
+                matches!(event, Ok(ThreadEvent::Stop(reason)) if *reason == expected_stop)
+            }));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_profile_change_respects_allowed_models(cx: &mut TestAppContext) {
+        for (restriction, expected_model) in [
+            (settings::AllowedSubagentModels::SelectedOnly, "fake"),
+            (settings::AllowedSubagentModels::Any, "profile-model"),
+        ] {
+            let (parent, _event_stream, fake) = setup_thread_for_test(cx).await;
+            let model = fake.model("fake");
+            fake.model("profile-model");
+            let profile_id = AgentProfileId("model-profile".into());
+            cx.update(|cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.allowed_subagent_models = restriction;
+                settings.selected_subagent_models = vec![selected_subagent_model("fake", "fake")];
+                let mut profile = settings.profiles.values().next().unwrap().clone();
+                profile.default_model = Some(LanguageModelSelection {
+                    provider: LanguageModelProviderSetting("fake".to_string()),
+                    model: "profile-model".to_string(),
+                    enable_thinking: false,
+                    effort: None,
+                    speed: None,
+                });
+                settings.profiles.insert(profile_id.clone(), profile);
+                AgentSettings::override_global(settings, cx);
+                parent.update(cx, |thread, cx| thread.set_model(model, cx));
+            });
+            let subagents = setup_parent_with_subagents(cx, &parent, 1);
+            let explicit_subagent = cx.update(|cx| {
+                let selection = LanguageModelSelection {
+                    provider: LanguageModelProviderSetting("fake".to_string()),
+                    model: "fake".to_string(),
+                    enable_thinking: false,
+                    effort: None,
+                    speed: None,
+                };
+                let subagent = cx.new(|cx| Thread::new_subagent(&parent, Some(&selection), cx));
+                parent.update(cx, |thread, _| {
+                    thread.register_running_subagent(subagent.downgrade())
+                });
+                subagent
+            });
+            parent.update(cx, |thread, cx| thread.set_profile(profile_id.clone(), cx));
+            parent.read_with(cx, |thread, _| {
+                assert_eq!(&*thread.model().unwrap().id().0, "profile-model")
+            });
+            subagents.first().unwrap().read_with(cx, |thread, _| {
+                assert_eq!(&*thread.model().unwrap().id().0, expected_model);
+                assert_eq!(thread.profile(), &profile_id);
+            });
+            explicit_subagent.read_with(cx, |thread, _| {
+                assert_eq!(&*thread.model().unwrap().id().0, "fake");
+                assert_eq!(thread.profile(), &profile_id);
+            });
+        }
     }
 
     struct ReplayImageTool;

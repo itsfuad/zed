@@ -3176,18 +3176,19 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 }
 
-fn subagent_model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
+fn subagent_model_selection(model: &LanguageModel, cx: &App) -> LanguageModelSelection {
     let settings = agent_settings::AgentSettings::get_global(cx);
-    let Some((provider, model)) = model_id.as_ref().split_once('/') else {
-        return model_id_to_selection(model_id, cx);
-    };
     if let Some(selection) = settings.subagent_model.as_ref()
-        && selection.provider.0 == provider
-        && selection.model == model
+        && selection.provider.0 == model.provider_id().0.as_ref()
+        && selection.model == model.id().0.as_ref()
     {
         return selection.clone();
     }
-    model_id_to_selection(model_id, cx)
+    let default_selection = settings.default_model.as_ref().filter(|selection| {
+        selection.provider.0 == model.provider_id().0.as_ref()
+            && selection.model == model.id().0.as_ref()
+    });
+    agent_settings::language_model_to_selection(model, default_selection)
 }
 
 fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
@@ -3669,21 +3670,28 @@ impl NativeThreadEnvironment {
         model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            anyhow::bail!("Parent thread no longer exists".to_string());
+        };
         let model = if let Some(model_id) = model {
-            let available = self.agent.read_with(cx, |agent, _| {
-                agent.models.model_from_id(&model_id).is_some()
-            })?;
-            if !available {
+            let Some(language_model) = self
+                .agent
+                .read_with(cx, |agent, _| agent.models.model_from_id(&model_id))?
+            else {
                 anyhow::bail!(
                     "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
                 );
-            }
-            Some(subagent_model_id_to_selection(&model_id, cx))
+            };
+            parent_thread_entity
+                .read(cx)
+                .ensure_subagent_model_permitted(
+                    &language_model.provider_id().0,
+                    &language_model.id().0,
+                    cx,
+                )?;
+            Some(subagent_model_selection(&language_model, cx))
         } else {
-            None
-        };
-        let Some(parent_thread_entity) = self.thread.upgrade() else {
-            anyhow::bail!("Parent thread no longer exists".to_string());
+            parent_thread_entity.read(cx).default_subagent_model(cx)?
         };
         let parent_thread = parent_thread_entity.read(cx);
         let current_depth = parent_thread.depth();
@@ -3701,6 +3709,13 @@ impl NativeThreadEnvironment {
             thread.set_title(label.into(), cx);
             thread
         });
+        // A configured subagent model that is unavailable leaves the subagent on
+        // the parent's model, which the user's settings may not permit either.
+        if let Some(model) = subagent_thread.read(cx).model() {
+            parent_thread_entity
+                .read(cx)
+                .ensure_subagent_model_permitted(&model.provider_id().0, &model.id().0, cx)?;
+        }
 
         let session_id = subagent_thread.read(cx).id().clone();
 
@@ -3751,6 +3766,23 @@ impl NativeThreadEnvironment {
         })??;
 
         let depth = subagent_thread.read(cx).depth();
+
+        anyhow::ensure!(
+            subagent_thread.read(cx).is_subagent()
+                || agent_settings::AgentSettings::get_global(cx).allowed_subagent_models
+                    == settings::AllowedSubagentModels::Any,
+            "Only subagent sessions can be resumed while subagent model restrictions are enabled."
+        );
+
+        // A resumed session keeps its model, so it has to be checked again: the
+        // settings or the parent's model may have changed since it was created.
+        if let Some(parent_thread_entity) = self.thread.upgrade()
+            && let Some(model) = subagent_thread.read(cx).model()
+        {
+            parent_thread_entity
+                .read(cx)
+                .ensure_subagent_model_permitted(&model.provider_id().0, &model.id().0, cx)?;
+        }
 
         if let Some(parent_thread_entity) = self.thread.upgrade() {
             telemetry::event!(
@@ -4427,7 +4459,7 @@ mod internal_tests {
     use std::path::Path;
 
     use super::*;
-    use crate::tests::release_dropped_entities;
+    use crate::tests::{release_dropped_entities, selected_subagent_model};
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use agent_settings::COMPACTION_PROMPT;
     use fs::FakeFs;
@@ -4439,7 +4471,7 @@ mod internal_tests {
         LanguageModelName, LanguageModelProviderId, LanguageModelProviderName, Speed,
     };
     use serde_json::json;
-    use settings::{LanguageModelProviderSetting, SettingsStore};
+    use settings::{AllowedSubagentModels, LanguageModelProviderSetting, SettingsStore};
     use util::{path, rel_path::rel_path};
 
     #[gpui::test]
@@ -4527,6 +4559,373 @@ mod internal_tests {
             // intentionally filtered while the model selection is applied.
             assert_eq!(thread.speed(), None);
         });
+    }
+
+    /// A parent thread on `parent-corp/parent-model`, with `parent-corp/sibling-model`
+    /// and `other-corp/other-model` also available.
+    struct SubagentModelTest {
+        agent: Entity<NativeAgent>,
+        parent_thread: Entity<Thread>,
+        // The environment only holds this weakly.
+        _acp_thread: Entity<AcpThread>,
+        environment: NativeThreadEnvironment,
+    }
+
+    impl SubagentModelTest {
+        async fn new(cx: &mut TestAppContext) -> Self {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/test"), json!({})).await;
+            let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+            let connection = Rc::new(NativeAgentConnection(agent.clone()));
+            let parent_provider = Arc::new(FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("parent-corp".to_string()),
+                LanguageModelProviderName::from("Parent Corp".to_string()),
+            ));
+            let parent_model = parent_provider.update_model("parent-model", |_| {});
+            parent_provider.update_model("sibling-model", |_| {});
+            let other_provider = Arc::new(FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("other-corp".to_string()),
+                LanguageModelProviderName::from("Other Corp".to_string()),
+            ));
+            other_provider.update_model("other-model", |_| {});
+            cx.update(|cx| {
+                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                    registry.register_provider(parent_provider, cx);
+                    registry.register_provider(other_provider, cx);
+                });
+            });
+            agent.update(cx, |agent, cx| agent.models.refresh_list(cx));
+
+            let acp_thread = cx
+                .update(|cx| {
+                    connection.new_session(project, PathList::new(&[Path::new("/test")]), cx)
+                })
+                .await
+                .unwrap();
+            let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+            let parent_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&session_id).unwrap().thread.clone()
+            });
+            parent_thread.update(cx, |thread, cx| thread.set_model(parent_model, cx));
+            Self {
+                environment: NativeThreadEnvironment {
+                    agent: agent.downgrade(),
+                    thread: parent_thread.downgrade(),
+                    acp_thread: acp_thread.downgrade(),
+                },
+                agent,
+                parent_thread,
+                _acp_thread: acp_thread,
+            }
+        }
+
+        fn update_settings(
+            cx: &mut TestAppContext,
+            update: impl FnOnce(&mut agent_settings::AgentSettings),
+        ) {
+            cx.update(|cx| {
+                let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+                update(&mut settings);
+                agent_settings::AgentSettings::override_global(settings, cx);
+            });
+        }
+
+        fn spawn(
+            &self,
+            model: Option<&str>,
+            cx: &mut TestAppContext,
+        ) -> Result<acp_v2::SessionId, String> {
+            cx.update(|cx| {
+                self.environment
+                    .create_subagent_thread(
+                        "subagent".to_string(),
+                        model.map(|model| AgentModelId::from(model.to_string())),
+                        cx,
+                    )
+                    .map(|handle| handle.id())
+                    .map_err(|error| error.to_string())
+            })
+        }
+
+        fn resume(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &mut TestAppContext,
+        ) -> Result<acp_v2::SessionId, String> {
+            cx.update(|cx| {
+                self.environment
+                    .resume_subagent_thread(session_id.clone(), cx)
+                    .map(|handle| handle.id())
+                    .map_err(|error| error.to_string())
+            })
+        }
+
+        fn model_of(&self, session_id: &acp_v2::SessionId, cx: &mut TestAppContext) -> String {
+            self.agent.read_with(cx, |agent, cx| {
+                let thread = agent.sessions.get(session_id).unwrap().thread.read(cx);
+                LanguageModels::model_id(thread.model().unwrap()).to_string()
+            })
+        }
+
+        fn set_parent_model(&self, model: &str, cx: &mut TestAppContext) {
+            let model = self.agent.read_with(cx, |agent, _| {
+                agent
+                    .models
+                    .model_from_id(&AgentModelId::from(model.to_string()))
+                    .unwrap()
+            });
+            self.parent_thread
+                .update(cx, |thread, cx| thread.set_model(model, cx));
+        }
+
+        fn offers_spawn_tool(&self, cx: &mut TestAppContext) -> bool {
+            self.parent_thread.read_with(cx, |thread, cx| {
+                thread
+                    .enabled_tools(cx)
+                    .contains_key(<crate::SpawnAgentTool as crate::AgentTool>::NAME)
+            })
+        }
+    }
+
+    fn other_corp_selection() -> LanguageModelSelection {
+        LanguageModelSelection {
+            provider: LanguageModelProviderSetting("other-corp".to_string()),
+            model: "other-model".to_string(),
+            enable_thinking: false,
+            effort: None,
+            speed: None,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_subagent_restrictions_reject_ordinary_sessions(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let parent_id = test
+            .parent_thread
+            .read_with(cx, |thread, _| thread.id().clone());
+        let child = test.spawn(None, cx).unwrap();
+        test.resume(&parent_id, cx).unwrap();
+        for restriction in [
+            AllowedSubagentModels::SameProvider,
+            AllowedSubagentModels::SelectedOnly,
+            AllowedSubagentModels::NoModels,
+        ] {
+            SubagentModelTest::update_settings(cx, |settings| {
+                settings.allowed_subagent_models = restriction;
+                settings.selected_subagent_models =
+                    vec![selected_subagent_model("parent-corp", "parent-model")];
+            });
+            assert!(
+                test.resume(&parent_id, cx)
+                    .unwrap_err()
+                    .contains("subagent")
+            );
+            if restriction == AllowedSubagentModels::NoModels {
+                test.resume(&child, cx).unwrap_err();
+            } else {
+                test.resume(&child, cx).unwrap();
+            }
+        }
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.allowed_subagent_models = AllowedSubagentModels::Any;
+        });
+        test.resume(&parent_id, cx).unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_subagent_models_with_slashes(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("team/api".to_string()),
+            LanguageModelProviderName::from("Team API".to_string()),
+        ));
+        provider.model("model/name");
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider, cx);
+            })
+        });
+        test.agent
+            .update(cx, |agent, cx| agent.models.refresh_list(cx));
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.allowed_subagent_models = AllowedSubagentModels::SelectedOnly;
+            settings.selected_subagent_models = serde_json::from_value(json!([
+                {"provider": "team/api", "model": "model/name"}
+            ]))
+            .unwrap();
+            settings.subagent_model = Some(LanguageModelSelection {
+                provider: LanguageModelProviderSetting("team/api".to_string()),
+                model: "model/name".to_string(),
+                ..other_corp_selection()
+            });
+        });
+        let configured = test.spawn(None, cx).unwrap();
+        assert_eq!(test.model_of(&configured, cx), "team/api/model/name");
+        let explicit = test.spawn(Some("team/api/model/name"), cx).unwrap();
+        assert_eq!(test.model_of(&explicit, cx), "team/api/model/name");
+
+        let other_provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("team".to_string()),
+            LanguageModelProviderName::from("Other Team".to_string()),
+        ));
+        other_provider.model("api/model/name");
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(other_provider, cx);
+            })
+        });
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.subagent_model = Some(LanguageModelSelection {
+                provider: LanguageModelProviderSetting("team".to_string()),
+                model: "api/model/name".to_string(),
+                ..other_corp_selection()
+            });
+        });
+        test.spawn(None, cx).unwrap_err();
+    }
+
+    #[gpui::test]
+    async fn test_subagent_models_same_provider(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let other_provider_session = test.spawn(Some("other-corp/other-model"), cx).unwrap();
+
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.allowed_subagent_models = AllowedSubagentModels::SameProvider;
+        });
+        assert!(
+            test.spawn(Some("other-corp/other-model"), cx)
+                .unwrap_err()
+                .contains("parent-corp")
+        );
+        test.spawn(Some("parent-corp/sibling-model"), cx).unwrap();
+        test.resume(&other_provider_session, cx).unwrap_err();
+
+        // A configured subagent model that the restriction excludes is neither
+        // accepted explicitly nor used as the default.
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.subagent_model = Some(other_corp_selection());
+        });
+        test.spawn(Some("other-corp/other-model"), cx).unwrap_err();
+        let default_session = test.spawn(None, cx).unwrap();
+        assert_eq!(
+            test.model_of(&default_session, cx),
+            "parent-corp/parent-model"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_models_selected_only(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let other_provider_session = test.spawn(Some("other-corp/other-model"), cx).unwrap();
+
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.allowed_subagent_models = AllowedSubagentModels::SelectedOnly;
+            settings.selected_subagent_models =
+                vec![selected_subagent_model("parent-corp", "sibling-model")];
+            settings.subagent_model = Some(other_corp_selection());
+        });
+        assert!(
+            test.spawn(Some("other-corp/other-model"), cx)
+                .unwrap_err()
+                .contains("parent-corp/sibling-model")
+        );
+        test.resume(&other_provider_session, cx).unwrap_err();
+        test.spawn(Some("parent-corp/sibling-model"), cx).unwrap();
+        // The parent's own model is not exempt, so there is no default to fall
+        // back to and the agent is told which models it may request.
+        test.spawn(Some("parent-corp/parent-model"), cx)
+            .unwrap_err();
+        assert!(
+            test.spawn(None, cx)
+                .unwrap_err()
+                .contains("parent-corp/sibling-model")
+        );
+
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings
+                .selected_subagent_models
+                .push(selected_subagent_model("other-corp", "other-model"));
+        });
+        test.resume(&other_provider_session, cx).unwrap();
+        let default_session = test.spawn(None, cx).unwrap();
+        assert_eq!(
+            test.model_of(&default_session, cx),
+            "other-corp/other-model"
+        );
+
+        // An unavailable configured model must not fall back to a parent model
+        // that is not selected.
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.subagent_model = Some(LanguageModelSelection {
+                model: "missing-model".to_string(),
+                ..other_corp_selection()
+            });
+            settings.selected_subagent_models =
+                vec![selected_subagent_model("other-corp", "missing-model")];
+        });
+        test.spawn(None, cx).unwrap_err();
+
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.subagent_model = None;
+            settings.selected_subagent_models =
+                vec![selected_subagent_model("parent-corp", "parent-model")];
+        });
+        let default_session = test.spawn(None, cx).unwrap();
+        assert_eq!(
+            test.model_of(&default_session, cx),
+            "parent-corp/parent-model"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagents_turned_off(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let session = test.spawn(Some("parent-corp/parent-model"), cx).unwrap();
+        assert!(test.offers_spawn_tool(cx));
+
+        let turn_off: [fn(&mut agent_settings::AgentSettings); 2] = [
+            |settings| settings.allowed_subagent_models = AllowedSubagentModels::SelectedOnly,
+            |settings| {
+                settings.allowed_subagent_models = AllowedSubagentModels::NoModels;
+                settings.selected_subagent_models =
+                    vec![selected_subagent_model("parent-corp", "parent-model")];
+            },
+        ];
+        for turn_off in turn_off {
+            SubagentModelTest::update_settings(cx, turn_off);
+            assert!(!test.offers_spawn_tool(cx));
+            assert!(test.spawn(None, cx).unwrap_err().contains("turned off"));
+            test.spawn(Some("parent-corp/parent-model"), cx)
+                .unwrap_err();
+            test.resume(&session, cx).unwrap_err();
+        }
+    }
+
+    #[gpui::test]
+    async fn test_parent_model_change_keeps_subagents_permitted(cx: &mut TestAppContext) {
+        let test = SubagentModelTest::new(cx).await;
+        let session = test.spawn(None, cx).unwrap();
+        // A subagent is only registered as running while it handles a prompt.
+        let subagent_thread = test.agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session).unwrap().thread.downgrade()
+        });
+        test.parent_thread.update(cx, |thread, _| {
+            thread.register_running_subagent(subagent_thread)
+        });
+
+        test.set_parent_model("parent-corp/sibling-model", cx);
+        assert_eq!(test.model_of(&session, cx), "parent-corp/sibling-model");
+
+        SubagentModelTest::update_settings(cx, |settings| {
+            settings.allowed_subagent_models = AllowedSubagentModels::SelectedOnly;
+            settings.selected_subagent_models =
+                vec![selected_subagent_model("parent-corp", "sibling-model")];
+        });
+        test.set_parent_model("parent-corp/parent-model", cx);
+        assert_eq!(test.model_of(&session, cx), "parent-corp/sibling-model");
     }
 
     #[cfg(target_os = "macos")]

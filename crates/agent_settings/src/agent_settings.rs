@@ -220,6 +220,8 @@ pub struct AgentSettings {
     pub max_content_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
+    pub allowed_subagent_models: settings::AllowedSubagentModels,
+    pub selected_subagent_models: Vec<settings::SubagentModel>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -263,6 +265,18 @@ pub struct ThreadsSidebarSettings {
 impl AgentSettings {
     pub fn enabled(&self, cx: &App) -> bool {
         self.enabled && !DisableAiSettings::get_global(cx).disable_ai
+    }
+
+    /// Whether `allowed_subagent_models` leaves any model for subagents to use.
+    pub fn subagents_enabled(&self) -> bool {
+        match self.allowed_subagent_models {
+            settings::AllowedSubagentModels::Any
+            | settings::AllowedSubagentModels::SameProvider => true,
+            settings::AllowedSubagentModels::SelectedOnly => {
+                !self.selected_subagent_models.is_empty()
+            }
+            settings::AllowedSubagentModels::NoModels => false,
+        }
     }
 
     pub fn temperature_for_model(model: &LanguageModel, cx: &App) -> Option<f32> {
@@ -797,6 +811,8 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
+            allowed_subagent_models: agent.allowed_subagent_models.unwrap(),
+            selected_subagent_models: agent.selected_subagent_models.unwrap(),
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools

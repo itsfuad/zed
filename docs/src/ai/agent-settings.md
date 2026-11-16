@@ -200,6 +200,43 @@ If the configured model is unavailable, subagents use the parent thread's model 
 
 The agent can only request a model for a subagent, not a separate effort or speed. Requesting the parent's own model is not the same as requesting no specific model: the table's rules for requested models apply instead of inheriting the parent's current settings. Subagents with a requested or configured model do not follow later changes to the parent's model, reasoning, or speed settings. Resuming a subagent keeps its existing model, reasoning, and speed settings.
 
+### Restricting Subagent Models {#restricting-subagent-models}
+
+By default, the agent can request any available model for a subagent, including models from a provider other than the one the thread uses. Set `agent.allowed_subagent_models` to limit this:
+
+| Value             | Models subagents may use                                              |
+| ----------------- | --------------------------------------------------------------------- |
+| `"any"` (default) | Any available model.                                                  |
+| `"same_provider"` | Only models from the provider of the thread that spawns the subagent. |
+| `"selected_only"` | Only the models listed in `agent.selected_subagent_models`.           |
+| `"none"`          | No model. The agent cannot spawn subagents.                           |
+
+List the selected models with separate `provider` and `model` fields, using the same values as in `agent.default_model`:
+
+```json [settings]
+{
+  "agent": {
+    "allowed_subagent_models": "selected_only",
+    "selected_subagent_models": [
+      { "provider": "anthropic", "model": "claude-sonnet-4-5" },
+      { "provider": "anthropic", "model": "claude-haiku-4-5" }
+    ]
+  }
+}
+```
+
+With `"selected_only"`, the model of the thread that spawns the subagent is not exempt. When the agent requests no specific model and neither `agent.subagent_model` nor the parent thread's model is selected, the request fails and the agent has to request one of the selected models.
+
+With `"none"`, or with `"selected_only"` and an empty list, subagents are off: Zed does not offer the agent the subagent tool, and existing subagents cannot be resumed.
+
+When restrictions are enabled, `spawn_agent` can only resume subagent sessions. It cannot resume an ordinary thread as a subagent.
+
+The restriction also applies to `agent.subagent_model`: if it is not permitted, it is not used. If it is permitted but unavailable, the subagent only falls back to the parent thread's model when that model is permitted too. Zed checks the setting when a subagent is created and again when one is resumed. A running subagent that follows the parent thread's model keeps its current model if you switch the thread to one that is not permitted, including when changing profiles. Subagents also cannot retry a refused request with a fallback model that is not permitted. A request for a model that is not permitted fails instead of falling back to another model.
+
+These settings only apply to subagents. They do not limit the model of a separate thread that the agent starts with the `create_thread` tool; to prevent that, turn the tool off in the [agent profile](./agent-profiles.md).
+
+You can also change these settings from the subagent button in the message editor, or with {#action agent::ToggleSubagentModelSelector}. The menu uses the same names: Any Model, Same Provider, Selected Only, and None. Under Selected Only, the menu also lists the available models; choosing one adds it to or removes it from the selected models. The button shows a crossed-out icon while subagents are off.
+
 ## Model Temperature {#model-temperature}
 
 Most Zed AI features use the selected model's default generation behavior.

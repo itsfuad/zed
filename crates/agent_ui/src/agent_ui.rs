@@ -25,6 +25,7 @@ mod model_search;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod subagent_model_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -383,6 +384,8 @@ actions!(
         CycleThinkingEffort,
         /// Toggles the thinking effort selector menu open or closed.
         ToggleThinkingEffortMenu,
+        /// Toggles the subagent model selector menu open or closed.
+        ToggleSubagentModelSelector,
         /// Toggles fast mode for models that support it.
         ToggleFastMode,
         /// Scroll the output by one page up.
@@ -1075,6 +1078,8 @@ mod tests {
             max_content_width: Some(px(850.)),
             default_model: None,
             subagent_model: None,
+            allowed_subagent_models: settings::AllowedSubagentModels::Any,
+            selected_subagent_models: Vec::new(),
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

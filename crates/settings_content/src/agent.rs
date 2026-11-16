@@ -286,6 +286,16 @@ pub struct AgentSettingsContent {
     /// thinking, effort, and speed settings when not specified. If the configured
     /// model is unavailable, the parent thread's model is used instead.
     pub subagent_model: Option<LanguageModelSelection>,
+    /// Which models subagents may use.
+    ///
+    /// Default: any
+    pub allowed_subagent_models: Option<AllowedSubagentModels>,
+    /// The models subagents may use when `allowed_subagent_models` is
+    /// `selected_only`, with separate `provider` and `model` fields. When empty,
+    /// subagents are off.
+    ///
+    /// Default: []
+    pub selected_subagent_models: Option<Vec<SubagentModel>>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -605,6 +615,39 @@ pub struct AgentProfileContent {
     pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
     /// The default language model selected when using this profile.
     pub default_model: Option<LanguageModelSelection>,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedSubagentModels {
+    /// Any available model.
+    Any,
+    /// Only models from the parent thread's provider.
+    SameProvider,
+    /// Only the models listed in `selected_subagent_models`.
+    SelectedOnly,
+    /// No model: the agent cannot spawn subagents.
+    #[serde(rename = "none")]
+    NoModels,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct SubagentModel {
+    pub provider: LanguageModelProviderSetting,
+    pub model: String,
+}
+
+impl SubagentModel {
+    pub fn matches_model(&self, provider: &str, model: &str) -> bool {
+        self.provider.0 == provider && self.model == model
+    }
+}
+
+impl std::fmt::Display for SubagentModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.provider.0, self.model)
+    }
 }
 
 #[with_fallible_options]

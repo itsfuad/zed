@@ -95,14 +95,14 @@ fn all_models(cx: &App) -> GroupedModels {
 type FavoritesIndex = HashMap<LanguageModelProviderId, HashSet<LanguageModelId>>;
 
 #[derive(Clone)]
-struct ModelInfo {
-    model: LanguageModel,
-    icon: IconOrSvg,
+pub(crate) struct ModelInfo {
+    pub(crate) model: LanguageModel,
+    pub(crate) icon: IconOrSvg,
     is_favorite: bool,
 }
 
 impl ModelInfo {
-    fn new(
+    pub(crate) fn new(
         provider: &dyn LanguageModelProvider,
         model: LanguageModel,
         favorites_index: &FavoritesIndex,
@@ -307,7 +307,7 @@ enum LanguageModelPickerEntry {
     Separator(SharedString),
 }
 
-struct ModelMatcher {
+pub(crate) struct ModelMatcher {
     models: Vec<ModelInfo>,
     fg_executor: ForegroundExecutor,
     bg_executor: BackgroundExecutor,
@@ -315,7 +315,7 @@ struct ModelMatcher {
 }
 
 impl ModelMatcher {
-    fn new(
+    pub(crate) fn new(
         models: Vec<ModelInfo>,
         fg_executor: ForegroundExecutor,
         bg_executor: BackgroundExecutor,

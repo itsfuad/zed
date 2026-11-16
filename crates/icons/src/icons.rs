@@ -292,6 +292,7 @@ pub enum IconName {
     UserArrowUp,
     UserCheck,
     UserGroup,
+    UserGroupOff,
     UserRoundPen,
     Warning,
     WholeWord,

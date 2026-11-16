@@ -66,6 +66,13 @@ pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<FakeLanguageModelProvide
     })
 }
 
+pub(crate) fn selected_subagent_model(provider: &str, model: &str) -> settings::SubagentModel {
+    settings::SubagentModel {
+        provider: provider.to_string().into(),
+        model: model.to_string(),
+    }
+}
+
 pub(crate) fn release_dropped_entities(cx: &mut TestAppContext) {
     cx.update(|_| ());
     cx.run_until_parked();
@@ -6867,7 +6874,11 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+    let model_selection = parent_thread
+        .read_with(cx, |thread, cx| thread.default_subagent_model(cx))
+        .unwrap();
+    let subagent_thread =
+        cx.new(|cx| Thread::new_subagent(&parent_thread, model_selection.as_ref(), cx));
     let explicit_selection = LanguageModelSelection {
         provider: LanguageModelProviderSetting("fake-corp".to_string()),
         model: "explicit-model".to_string(),

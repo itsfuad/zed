@@ -793,6 +793,8 @@ pub struct ThreadView {
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pub subagent_model_menu_handle:
+        PopoverMenuHandle<crate::subagent_model_selector::SubagentModelSelector>,
     pub project: WeakEntity<Project>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Cloned from the parent `ConversationView` so the cache is shared and the
@@ -1323,6 +1325,7 @@ impl ThreadView {
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             fast_mode_menu_handle: PopoverMenuHandle::default(),
+            subagent_model_menu_handle: PopoverMenuHandle::default(),
             project,
             code_span_resolver,
             show_external_source_prompt_warning,
@@ -5685,7 +5688,8 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_thinking_control(cx))
+                                    .children(self.render_subagent_control(cx)),
                             )
                             .child(
                                 h_flex()
@@ -6285,6 +6289,52 @@ impl ThreadView {
                         }),
                 )
                 .child(Divider::vertical())
+                .into_any_element(),
+        )
+    }
+
+    fn render_subagent_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.is_subagent() {
+            return None;
+        }
+        let thread = self.as_native_thread(cx)?;
+        let agent_settings = AgentSettings::get_global(cx);
+        let can_spawn_subagents = agent_settings
+            .profiles
+            .get(thread.read(cx).profile())
+            .is_some_and(|profile| {
+                profile.is_tool_enabled(<agent::SpawnAgentTool as agent::AgentTool>::NAME)
+            });
+        if !can_spawn_subagents {
+            return None;
+        }
+        let (icon, icon_color, tooltip_title) = if !agent_settings.subagents_enabled() {
+            (IconName::UserGroupOff, Color::Muted, "Subagents Are Off")
+        } else if agent_settings.allowed_subagent_models != settings::AllowedSubagentModels::Any {
+            (IconName::UserGroup, Color::Accent, "Subagent Models")
+        } else {
+            (IconName::UserGroup, Color::Muted, "Subagent Models")
+        };
+
+        Some(
+            PopoverMenu::new("subagent-model-selector")
+                .trigger_with_tooltip(
+                    IconButton::new("subagent-model-selector-trigger", icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(icon_color),
+                    Tooltip::for_action_title(tooltip_title, &ToggleSubagentModelSelector),
+                )
+                .menu(|window, cx| {
+                    Some(cx.new(|cx| {
+                        crate::subagent_model_selector::subagent_model_selector(window, cx)
+                    }))
+                })
+                .with_handle(self.subagent_model_menu_handle.clone())
+                .anchor(gpui::Anchor::BottomLeft)
+                .offset(gpui::Point {
+                    x: px(0.0),
+                    y: px(-2.0),
+                })
                 .into_any_element(),
         )
     }
@@ -14197,6 +14247,14 @@ impl Render for ThreadView {
                         }
                     }
                     let menu_handle = this.thinking_effort_menu_handle.clone();
+                    window.defer(cx, move |window, cx| {
+                        menu_handle.toggle(window, cx);
+                    });
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleSubagentModelSelector, window, cx| {
+                    let menu_handle = this.subagent_model_menu_handle.clone();
                     window.defer(cx, move |window, cx| {
                         menu_handle.toggle(window, cx);
                     });

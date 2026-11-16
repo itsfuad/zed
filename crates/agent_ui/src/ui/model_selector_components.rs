@@ -188,15 +188,17 @@ impl RenderOnce for ModelSelectorListItem {
                         this.child(Icon::new(IconName::Info).color(Color::Muted))
                     }),
             )
-            .when(!is_disabled, |this| {
-                this.end_slot_on_hover(div().pr_1p5().when_some(self.on_toggle_favorite, {
-                    |this, handle_click| {
-                        let (icon, color, tooltip) = if is_favorite {
-                            (IconName::StarFilled, Color::Accent, "Unfavorite Model")
-                        } else {
-                            (IconName::Star, Color::Default, "Favorite Model")
-                        };
-                        this.child(
+            // Swapping in an empty hover slot would collapse the end slot and hide the check mark.
+            .when_some(
+                self.on_toggle_favorite.filter(|_| !is_disabled),
+                |this, handle_click| {
+                    let (icon, color, tooltip) = if is_favorite {
+                        (IconName::StarFilled, Color::Accent, "Unfavorite Model")
+                    } else {
+                        (IconName::Star, Color::Default, "Favorite Model")
+                    };
+                    this.end_slot_on_hover(
+                        div().pr_1p5().child(
                             IconButton::new(("toggle-favorite", self.index), icon)
                                 .layer(ElevationIndex::ElevatedSurface)
                                 .icon_color(color)
@@ -205,10 +207,10 @@ impl RenderOnce for ModelSelectorListItem {
                                 .on_click(move |event, window, cx| {
                                     (handle_click)(event, window, cx)
                                 }),
-                        )
-                    }
-                }))
-            })
+                        ),
+                    )
+                },
+            )
     }
 }
 

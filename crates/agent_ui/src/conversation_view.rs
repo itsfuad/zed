@@ -100,8 +100,8 @@ use crate::{
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
     ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
-    ToggleThinkingMode, UndoLastReject,
+    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleSubagentModelSelector,
+    ToggleThinkingEffortMenu, ToggleThinkingMode, UndoLastReject,
 };
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
